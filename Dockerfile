@@ -12,6 +12,11 @@ FROM nvcr.io/nvidia/isaac-sim:4.5.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ACCEPT_EULA=Y
 ENV PRIVACY_CONSENT=Y
+# The base image leaves TERM set to something tput can't resolve inside a
+# non-interactive build. IsaacLab's installer uses tput for colored output,
+# and tput failing with 'set -e' kills the build. 'dumb' disables colors
+# but is universally supported.
+ENV TERM=dumb
 
 # System tools we add on top of the base
 RUN apt-get update && apt-get install -y --no-install-recommends \

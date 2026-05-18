@@ -11,6 +11,8 @@
 
 # Base: CUDA 11.8 + cuDNN, Ubuntu 22.04. Smaller than nvcr.io/isaac-sim and
 # all we need is CUDA + a place to pip-install isaacsim wheels.
+
+
 FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive

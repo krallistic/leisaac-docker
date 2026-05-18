@@ -11,8 +11,6 @@
 
 # Base: CUDA 11.8 + cuDNN, Ubuntu 22.04. Smaller than nvcr.io/isaac-sim and
 # all we need is CUDA + a place to pip-install isaacsim wheels.
-
-
 FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -35,6 +33,12 @@ RUN conda create -y -n leisaac python=3.10 && conda clean -ya
 ENV CONDA_DEFAULT_ENV=leisaac
 ENV PATH=/opt/conda/envs/leisaac/bin:$PATH
 
+# Build tooling. Pin setuptools<70 because some older sdists in the IsaacLab
+# dependency tree (notably flatdict) still 'import pkg_resources' at setup.py
+# time, which setuptools 70+ no longer guarantees in build environments.
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir 'setuptools<70' wheel
+
 # Layer 4: PyTorch + cu118 (~5 GB)
 RUN pip install --no-cache-dir \
         torch==2.5.1 torchvision==0.20.1 \
@@ -47,13 +51,16 @@ RUN pip install --no-cache-dir 'isaacsim[all,extscache]==4.5.0' \
         --extra-index-url https://pypi.nvidia.com
 
 # Layer 6: IsaacLab v2.1.0 (~2 GB)
+# --no-build-isolation lets the sdist builds reuse the conda env's pinned
+# setuptools<70 (which still exposes pkg_resources) instead of grabbing a
+# fresh setuptools that may have dropped it.
 RUN git clone -b v2.1.0 https://github.com/isaac-sim/IsaacLab.git /opt/IsaacLab && \
     cd /opt/IsaacLab && \
-    pip install --no-cache-dir -e source/isaaclab && \
-    pip install --no-cache-dir -e source/isaaclab_assets && \
-    pip install --no-cache-dir -e source/isaaclab_tasks && \
-    pip install --no-cache-dir -e source/isaaclab_rl && \
-    pip install --no-cache-dir -e source/isaaclab_mimic
+    pip install --no-cache-dir --no-build-isolation -e source/isaaclab && \
+    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_assets && \
+    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_tasks && \
+    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_rl && \
+    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_mimic
 
 # Layer 7: smaller deps (~50 MB)
 RUN pip install --no-cache-dir pyzmq

@@ -1,72 +1,39 @@
 # Dockerfile
-# Builds a LeIsaac-ready image with Isaac Sim 4.5, IsaacLab 2.1.0, and PyTorch.
-# Layers are split intentionally to stay under GHCR's 10GB per-layer hard limit
-# and 10 minute per-layer upload timeout.
+# Base: NVIDIA's official Isaac Sim image (requires NGC auth to pull).
+# This avoids having to recreate Isaac Sim's Python env from scratch. The base
+# already has Isaac Sim with its bundled Python at /isaac-sim/python.sh, with
+# all of NVIDIA's preinstalled deps. We just install IsaacLab on top using
+# its own installer.
 #
-# This image does NOT contain your forks of lerobot/leisaac. Those get cloned
-# at runtime inside the instance via setup-instance.sh so you can iterate
-# without rebuilding the image.
-#
-# Build size: ~21 GB total, largest single layer ~7 GB (Isaac Sim wheels).
+# Image size: ~16 GB total (~14 GB base, ~2 GB additions).
 
-# Base: CUDA 11.8 + cuDNN, Ubuntu 22.04. Smaller than nvcr.io/isaac-sim and
-# all we need is CUDA + a place to pip-install isaacsim wheels.
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvcr.io/nvidia/isaac-sim:4.5.0
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV ACCEPT_EULA=Y
+ENV PRIVACY_CONSENT=Y
 
-# Layer 1: system deps (~200 MB)
+# System tools we add on top of the base
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake build-essential git tmux wget curl ca-certificates \
-        libxext6 libx11-6 libxrender1 libsm6 libglu1-mesa libxi6 libxrandr2 \
-        libxinerama1 libxcursor1 libegl1 libgl1 libgomp1 \
+        git tmux wget curl ca-certificates cmake build-essential \
         openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 2: miniforge (~500 MB)
-RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/m.sh && \
-    bash /tmp/m.sh -b -p /opt/conda && rm /tmp/m.sh
-ENV PATH=/opt/conda/bin:$PATH
+# Clone and install IsaacLab using its own installer.
+# The installer uses /isaac-sim/python.sh (the bundled Python) and handles
+# version pinning, dep ordering, and all the awkward bits we were trying
+# to do manually.
+RUN git clone -b v2.1.0 https://github.com/isaac-sim/IsaacLab.git /isaaclab && \
+    cd /isaaclab && \
+    ln -s /isaac-sim _isaac_sim && \
+    ./isaaclab.sh --install
 
-# Layer 3: conda env with python (~1 GB)
-RUN conda create -y -n leisaac python=3.10 && conda clean -ya
-ENV CONDA_DEFAULT_ENV=leisaac
-ENV PATH=/opt/conda/envs/leisaac/bin:$PATH
+# Extra deps for the remote teleop ZMQ tunnel
+RUN /isaac-sim/python.sh -m pip install pyzmq
 
-# Build tooling. Pin setuptools<70 because some older sdists in the IsaacLab
-# dependency tree (notably flatdict) still 'import pkg_resources' at setup.py
-# time, which setuptools 70+ no longer guarantees in build environments.
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir 'setuptools<70' wheel
-
-# Layer 4: PyTorch + cu118 (~5 GB)
-RUN pip install --no-cache-dir \
-        torch==2.5.1 torchvision==0.20.1 \
-        --index-url https://download.pytorch.org/whl/cu118
-
-# Layer 5: Isaac Sim 4.5.0 wheels (~7 GB)
-# This is the biggest layer. Stays under both the 10 GB cap and 10 min upload
-# timeout from a fast GHA runner.
-RUN pip install --no-cache-dir 'isaacsim[all,extscache]==4.5.0' \
-        --extra-index-url https://pypi.nvidia.com
-
-# Layer 6: IsaacLab v2.1.0 (~2 GB)
-# --no-build-isolation lets the sdist builds reuse the conda env's pinned
-# setuptools<70 (which still exposes pkg_resources) instead of grabbing a
-# fresh setuptools that may have dropped it.
-RUN git clone -b v2.1.0 https://github.com/isaac-sim/IsaacLab.git /opt/IsaacLab && \
-    cd /opt/IsaacLab && \
-    pip install --no-cache-dir --no-build-isolation -e source/isaaclab && \
-    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_assets && \
-    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_tasks && \
-    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_rl && \
-    pip install --no-cache-dir --no-build-isolation -e source/isaaclab_mimic
-
-# Layer 7: smaller deps (~50 MB)
-RUN pip install --no-cache-dir pyzmq
-
-# Convenience: auto-activate the env on shell login
-RUN echo "source /opt/conda/etc/profile.d/conda.sh && conda activate leisaac" >> /root/.bashrc
+# Convenience: in interactive shells, 'python' and 'pip' point to Isaac Sim's
+# bundled tools. lerobot/leisaac will install against the same Python.
+RUN echo 'alias python="/isaac-sim/python.sh"' >> /root/.bashrc && \
+    echo 'alias pip="/isaac-sim/python.sh -m pip"' >> /root/.bashrc
 
 WORKDIR /workspace
-ENV ACCEPT_EULA=Y PRIVACY_CONSENT=Y

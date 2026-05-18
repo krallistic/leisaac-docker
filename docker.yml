@@ -1,0 +1,72 @@
+name: Build and push Docker image to GHCR
+
+# Triggers on:
+#   - push to main that touches the Dockerfile or this workflow
+#   - manual via "Run workflow" button in the Actions tab
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+# Repo-level permissions: write packages so we can push to ghcr.io
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # The default GHA runner only has ~14 GB free; this image needs ~25 GB
+      # during build. This action frees up ~30 GB by deleting things the
+      # build doesn't need (Android SDK, .NET, GHC, etc).
+      - name: Free up runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false       # keep cached tools
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false    # we need Docker
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Lowercase the repo owner; GHCR refuses upper-case in image names.
+      - name: Lowercase image namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >>"$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.ns.outputs.owner }}/leisaac:latest
+            ghcr.io/${{ steps.ns.outputs.owner }}/leisaac:${{ github.sha }}
+          # GHA cache reuses layers across runs; reduces rebuild time from
+          # ~50 min to ~5 min if only later layers changed.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo "Pushed ghcr.io/${{ steps.ns.outputs.owner }}/leisaac:latest"

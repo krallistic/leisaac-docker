@@ -12,11 +12,6 @@ FROM nvcr.io/nvidia/isaac-sim:4.5.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ACCEPT_EULA=Y
 ENV PRIVACY_CONSENT=Y
-# The base image leaves TERM set to something tput can't resolve inside a
-# non-interactive build. IsaacLab's installer uses tput for colored output,
-# and tput failing with 'set -e' kills the build. 'dumb' disables colors
-# but is universally supported.
-ENV TERM=dumb
 
 # System tools we add on top of the base
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,14 +19,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and install IsaacLab using its own installer.
-# The installer uses /isaac-sim/python.sh (the bundled Python) and handles
-# version pinning, dep ordering, and all the awkward bits we were trying
-# to do manually.
+# Clone IsaacLab and install its subpackages directly via pip against Isaac
+# Sim's bundled Python. We bypass the `isaaclab.sh --install` wrapper because
+# it uses tput/tabs for colored output, which fails inside Docker build
+# environments where the TERM isn't a full terminal. Direct pip installs do
+# exactly the same work without any TTY dependency.
 RUN git clone -b v2.1.0 https://github.com/isaac-sim/IsaacLab.git /isaaclab && \
     cd /isaaclab && \
     ln -s /isaac-sim _isaac_sim && \
-    ./isaaclab.sh --install
+    /isaac-sim/python.sh -m pip install --upgrade pip && \
+    /isaac-sim/python.sh -m pip install -e source/isaaclab && \
+    /isaac-sim/python.sh -m pip install -e source/isaaclab_assets && \
+    /isaac-sim/python.sh -m pip install -e source/isaaclab_mimic && \
+    /isaac-sim/python.sh -m pip install -e source/isaaclab_rl && \
+    /isaac-sim/python.sh -m pip install -e source/isaaclab_tasks
 
 # Extra deps for the remote teleop ZMQ tunnel
 RUN /isaac-sim/python.sh -m pip install pyzmq

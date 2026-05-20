@@ -36,9 +36,4 @@ RUN /isaac-sim/python.sh -m pip install pyzmq
 RUN echo 'alias python="/isaac-sim/python.sh"' >> /root/.bashrc && \
     echo 'alias pip="/isaac-sim/python.sh -m pip"' >> /root/.bashrc
 
-
-# Tailscale for WireGuard mesh between laptop and the Vast container.
-# Used to give WebRTC streaming a flat network without NAT traversal.
-RUN curl -fsSL https://tailscale.com/install.sh | sh
-
 WORKDIR /workspace

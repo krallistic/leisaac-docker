@@ -20,7 +20,7 @@ export GCP_SSH_KEY="$HOME/.ssh/google_compute_engine"
 export GCP_SSH_USER="$USER"               # GCP sets up an account with your local username
 
 # ── Filled in automatically by create-gcp-instance.sh / setup-ssh.sh ─────
-export GCP_EXTERNAL_IP="35.231.79.36"
+export GCP_EXTERNAL_IP="35.231.57.203"
 
 # ── WebRTC ports (direct — no remapping on GCP, opened via firewall rule) ─
 export SIGNAL_PORT="49100"     # TCP — Isaac Sim WebRTC signaling
@@ -36,4 +36,4 @@ export REMOTE_CONDA="/opt/miniconda3"
 export REMOTE_PYTHON="$REMOTE_CONDA/envs/leisaac/bin/python"
 export REMOTE_WORK="/workspace"
 
-export GCP_ZONE="us-east1-c"
+export GCP_ZONE="us-east1-b"

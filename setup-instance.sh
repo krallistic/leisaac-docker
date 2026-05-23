@@ -1,11 +1,15 @@
 #!/bin/bash
-# setup-instance.sh
+# setup-instance.sh  —  PHASE 2 of 2  (run AFTER setup-drivers.sh + reboot)
 # Run ON THE GCP INSTANCE (as root or with sudo).
 #
 # Instead of installing Isaac Sim / IsaacLab by hand, we use the official
 # NVIDIA isaac-lab:2.3.2 Docker image which ships everything pre-installed
-# and tested. This script just sets up Docker, builds the thin leisaac layer
-# on top, and downloads the USD assets to a host volume.
+# and tested. This script sets up Docker, builds the thin leisaac layer on
+# top, and downloads the USD assets to a host volume.
+#
+# PREREQUISITE: setup-drivers.sh must have run first (it installs the host
+# graphics + video-codec driver libraries and reboots). The gate in section
+# 1b fails fast if that step was skipped.
 #
 # Re-running is idempotent.
 
@@ -17,7 +21,7 @@ source "$SCRIPT_DIR/env.sh" 2>/dev/null || true
 
 echo ""
 echo "================================================================"
-echo "leisaac GCP setup (Docker) — $(date)"
+echo "leisaac GCP setup (Docker) — PHASE 2/2 — $(date)"
 echo "================================================================"
 echo ""
 
@@ -31,9 +35,29 @@ echo ">>> NVIDIA driver check..."
 if ! nvidia-smi &>/dev/null; then
     echo "ERROR: nvidia-smi failed. Use the GCP Deep Learning VM image:"
     echo "       common-cu129-ubuntu-2204-nvidia-580 (deeplearning-platform-release)"
+    echo "       If you just ran setup-drivers.sh, a reboot may still be pending."
     exit 1
 fi
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+echo ""
+
+# === 1b. Graphics + codec library gate (PHASE 1 prerequisite) =============
+# Isaac Sim needs the NVIDIA graphics (Vulkan/RTX) and video-codec (NVENC for
+# WebRTC) userspace libs ON THE HOST so the container toolkit can inject them.
+# The GCP "-server" driver flavor omits these; setup-drivers.sh installs them.
+echo ">>> Verifying host graphics + codec libraries (from setup-drivers.sh)..."
+MISSING=""
+ldconfig -p | grep -q 'libGLX_nvidia\.so'    || MISSING="${MISSING} libGLX_nvidia[Vulkan/RTX]"
+ldconfig -p | grep -q 'libnvidia-encode\.so' || MISSING="${MISSING} libnvidia-encode[NVENC/WebRTC]"
+ldconfig -p | grep -q 'libnvcuvid\.so'       || MISSING="${MISSING} libnvcuvid[NVDEC]"
+if [ -n "$MISSING" ]; then
+    echo ""
+    echo "ERROR: missing host driver libraries:${MISSING}"
+    echo "       Run PHASE 1 first (it installs them and reboots):"
+    echo "           sudo bash ${SCRIPT_DIR}/setup-drivers.sh"
+    exit 1
+fi
+echo ">>> Graphics + codec libraries present."
 echo ""
 
 # === 2. Docker + NVIDIA Container Toolkit =================================
@@ -61,6 +85,13 @@ systemctl restart docker
 # Quick GPU-in-container sanity check
 echo ">>> Verifying GPU is visible in Docker..."
 docker run --rm --gpus all ubuntu:22.04 nvidia-smi -L
+
+# Verify the toolkit now injects the graphics + codec libs into the container
+echo ">>> Verifying graphics + codec libs are injected into the container..."
+docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
+    --entrypoint bash ubuntu:22.04 -c \
+    'ldconfig -p | grep -E "libGLX_nvidia|libnvidia-encode|libnvcuvid"' \
+    || echo "    WARNING: not all graphics/codec libs were injected — check toolkit + caps."
 echo ""
 
 # === 3. Pull base image ===================================================
@@ -91,14 +122,11 @@ EXPECTED_ASSET="${ASSETS_DIR}/scenes/kitchen_with_orange/scene.usd"
 
 if [ ! -f "${EXPECTED_ASSET}" ]; then
     echo ">>> Downloading LeIsaac assets from HuggingFace (host Python)..."
-    # Determine the real user even when running under sudo
     REAL_USER="${SUDO_USER:-$USER}"
     mkdir -p "${WORK_DIR}/leisaac"
     chown -R "${REAL_USER}:${REAL_USER}" "${WORK_DIR}"
     sudo apt-get install -y python3-pip -qq 2>/dev/null || true
     python3 -m pip install -q huggingface_hub
-    # HF_HOME redirects huggingface's cache out of the target dir,
-    # avoiding a PermissionError when the dir was created as root.
     sudo -u "${REAL_USER}" HF_HOME=/tmp/hf_cache python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download(

@@ -1,0 +1,95 @@
+# Dockerfile.convert  —  leisaac-convert:latest
+# ----------------------------------------------------------------------------
+# STEP 2 ONLY: convert recorded IsaacLab HDF5 -> LeRobot Dataset (v2).
+#
+# Conversion is the one step that needs BOTH worlds in one interpreter, because
+# leisaac's isaaclab2lerobot.py calls gym.make(task) to build the LeRobot
+# feature schema from the live env. So this is a dedicated, minimal image:
+# the Isaac base + leisaac + a THIN, hand-picked slice of lerobot's dataset
+# WRITER deps. No training/policy deps (no diffusers/transformers/wandb/draccus/
+# gymnasium/rerun/opencv/...). Training + serving live in a separate pure-lerobot
+# image; recording/teleop/eval-client stay in leisaac:latest.
+#
+# Why this is safe (verified against this exact base + your forks):
+#   isaac-lab:2.3.2 already ships torch 2.7.0+cu128, torchvision 0.22.0,
+#   numpy 1.26.0, PIL, huggingface_hub  -> we DO NOT touch any of them.
+#   Missing-from-image writer deps = datasets, av, jsonlines (+ pyarrow/pandas
+#   pulled by datasets). That's the whole delta.
+#
+# Your lerobot fork uses the OLD layout (lerobot.common.datasets.*) and its
+# add_frame(frame, task, timestamp) matches the v2 converter, so it is NOT
+# affected by leisaac issue #150 (a lerobot-0.4.2-only break). We only redirect
+# two import lines from the flattened layout the leisaac scripts assume.
+#
+# torchcodec is intentionally omitted: video_utils gates it behind find_spec()
+# and falls back to pyav; conversion only ENCODES video, never decodes.
+#
+# LAYER ORDER is deliberate for caching: the slow third-party dep slice
+# (datasets -> pyarrow/pandas) sits BEFORE the ARG CACHEBUST line, so it stays
+# cached. The fork clones + editable installs sit AFTER it, so build-all.sh can
+# bust ONLY the clones (fresh forks every build) without re-pulling pyarrow.
+#
+# Build on the VM:
+#   docker build -f Dockerfile.convert -t leisaac-convert:latest .
+#   # force fresh fork clones (handled by build-all.sh):
+#   docker build -f Dockerfile.convert --build-arg CACHEBUST=$(date +%s) -t leisaac-convert:latest .
+# ----------------------------------------------------------------------------
+FROM nvcr.io/nvidia/isaac-lab:2.3.2
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ACCEPT_EULA=Y
+ENV PRIVACY_CONSENT=Y
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Thin writer-deps slice (CACHED: independent of the forks). ---------------
+#     datasets pulls pyarrow/pandas (the slow part); pin <=3.6.0 to avoid a
+#     numpy-2 combo, then reassert numpy 1.26 to match the Isaac base.
+RUN /isaac-sim/python.sh -m pip install \
+        "datasets>=2.19.0,<=3.6.0" \
+        "av>=14.2.0" \
+        "jsonlines>=4.0.0" \
+    && /isaac-sim/python.sh -m pip install "numpy==1.26.0" draccus
+
+# === Everything below re-runs when CACHEBUST changes (fresh fork clones). =====
+ARG CACHEBUST=0
+
+# --- leisaac fork (provides the converter, task registration, feature builders).
+#     Installed WITHOUT extras, so its optional `lerobot` pin is never pulled. ---
+ARG LEISAAC_REPO=https://github.com/krallistic/leisaac.git
+ARG LEISAAC_BRANCH=
+RUN git clone ${LEISAAC_REPO} /workspace/leisaac \
+    && cd /workspace/leisaac \
+    && if [ -n "${LEISAAC_BRANCH}" ]; then git checkout ${LEISAAC_BRANCH}; fi \
+    && /isaac-sim/python.sh -m pip install -e source/leisaac
+
+# --- Redirect the flattened-layout imports to your fork's common/ layout.
+#     Two sites cover the entire v2 conversion path:
+#       1) scripts/convert/isaaclab2lerobot.py   (hard import — the crash point)
+#       2) enhance/.../lerobot_dataset_handler.py (try/except guarded; flip to True) ---
+RUN cd /workspace/leisaac \
+    && sed -i 's#from lerobot\.datasets\.lerobot_dataset import LeRobotDataset#from lerobot.common.datasets.lerobot_dataset import LeRobotDataset#' \
+        scripts/convert/isaaclab2lerobot.py \
+        source/leisaac/leisaac/enhance/datasets/lerobot_dataset_handler.py \
+    && echo "Patched converter imports to lerobot.common.datasets:" \
+    && grep -n "lerobot_dataset import LeRobotDataset" \
+        scripts/convert/isaaclab2lerobot.py \
+        source/leisaac/leisaac/enhance/datasets/lerobot_dataset_handler.py
+
+# --- Your lerobot fork: package ONLY, no dependency closure. ------------------
+ARG LEROBOT_REPO=https://github.com/krallistic/lerobot.git
+ARG LEROBOT_BRANCH=
+RUN git clone ${LEROBOT_REPO} /workspace/lerobot \
+    && cd /workspace/lerobot \
+    && if [ -n "${LEROBOT_BRANCH}" ]; then git checkout ${LEROBOT_BRANCH}; fi \
+    && /isaac-sim/python.sh -m pip install --no-deps .
+
+# --- Build-time gate: fail now (not mid-conversion) if the slice is wrong. -----
+RUN /isaac-sim/python.sh -c "\
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset; \
+import datasets, av, jsonlines, torch, torchvision, numpy, PIL; \
+print('convert image OK | torch', torch.__version__, '| tv', torchvision.__version__, '| numpy', numpy.__version__)"
+
+WORKDIR /workspace

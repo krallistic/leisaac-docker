@@ -1,0 +1,50 @@
+# Dockerfile.train  —  lerobot:latest
+# ----------------------------------------------------------------------------
+# Pure-lerobot image for TRAINING and SERVING LeRobot policies.
+# Decoupled from Isaac Sim; communicates with the leisaac eval container
+# (leisaac:latest) over the AsyncInference gRPC interface.
+#
+# The server module path lerobot.scripts.server is intentional: the leisaac
+# client sets __module__ = "lerobot.scripts.server.helpers" on pickled types
+# (RemotePolicyConfig, TimedObservation, TimedAction) so that the server can
+# deserialise them natively without any sys.modules patching.
+#
+# grpcio==1.74.0 and protobuf==6.32.0 match the versions used by leisaac's
+# lerobot-async extra and must be kept in sync across both images.
+#
+# Build on the VM:
+#   docker build -f Dockerfile.train -t lerobot:latest .
+#   docker build -f Dockerfile.train --build-arg CACHEBUST=$(date +%s) -t lerobot:latest .
+# ----------------------------------------------------------------------------
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+
+ARG PYTHON_VERSION=3.10
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git \
+        libglib2.0-0 libgl1-mesa-glx libegl1-mesa ffmpeg \
+        libgeos-dev \
+        python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    && ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python \
+    && python -m venv /opt/venv \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# === Everything below re-runs when CACHEBUST changes (fresh fork clone). ====
+ARG CACHEBUST=0
+
+# --- lerobot fork with training + serving deps. --------------------------------
+# smolvla pulls transformers/accelerate (the key training deps).
+# grpcio/protobuf are pinned to match the versions in leisaac's lerobot-async
+# extra so that the AsyncInference gRPC transport is binary-compatible.
+ARG LEROBOT_REPO=https://github.com/krallistic/lerobot.git
+ARG LEROBOT_BRANCH=
+RUN git clone ${LEROBOT_REPO} /lerobot \
+    && cd /lerobot \
+    && if [ -n "${LEROBOT_BRANCH}" ]; then git checkout ${LEROBOT_BRANCH}; fi \
+    && /opt/venv/bin/pip install --upgrade --no-cache-dir pip \
+    && /opt/venv/bin/pip install --no-cache-dir ".[smolvla]" \
+    && /opt/venv/bin/pip install --no-cache-dir "grpcio==1.74.0" "protobuf==6.32.0"
+
+WORKDIR /lerobot

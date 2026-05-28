@@ -102,5 +102,8 @@ docker run --rm --gpus all --network=host \
         --teleop_device=so101leader \
         --remote_endpoint=tcp://localhost:5556 \
         --num_envs=1 --device=cuda --headless --enable_cameras \
-        --livestream 1 \
+        --livestream 2 \
         --kit_args="${KIT_ARGS}"
+
+
+docker run -rm -gpus all --network=host

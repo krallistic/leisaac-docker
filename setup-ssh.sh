@@ -106,9 +106,6 @@ done
 if [ "$SSH_READY" != "1" ]; then
     echo ""
     echo "WARNING: SSH didn't come up within 60s."
-    echo "         Once 'ssh ${GCP_SSH_ALIAS}' works, manually run:"
-    echo "         scp -r $SCRIPT_DIR/*.sh $SCRIPT_DIR/env.sh \\"
-    echo "             ${GCP_SSH_ALIAS}:/workspace/"
     exit 0
 fi
 
@@ -116,12 +113,14 @@ fi
 echo ""
 echo ">>> Copying bundle to ${GCP_SSH_ALIAS}:/workspace/ ..."
 ssh "${GCP_SSH_ALIAS}" "sudo mkdir -p /workspace && sudo chown \$USER:\$USER /workspace"
-scp -q \
+# -r so the tests/ subdir is recursed into (plain scp skips directories).
+# The /* glob brings env.sh, keys.sh (if present), *.sh, Dockerfile and tests/.
+scp -rq \
     "$SCRIPT_DIR"/* \
     "${GCP_SSH_ALIAS}":/workspace/
-ssh "${GCP_SSH_ALIAS}" "chmod +x /workspace/*.sh"
+ssh "${GCP_SSH_ALIAS}" "chmod +x /workspace/*.sh /workspace/tests/*.sh 2>/dev/null || true"
 echo ">>> Bundle copied."
 echo ""
 echo "Next:"
 echo "    ssh ${GCP_SSH_ALIAS}"
-echo "    sudo bash /workspace/setup-instance.sh"
+echo "    sudo bash /workspace/setup-drivers.sh"

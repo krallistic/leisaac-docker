@@ -68,6 +68,25 @@ for r in $FALLBACK_REGIONS; do
     [ "$r" != "$GCP_REGION" ] && REGIONS_TO_TRY="$REGIONS_TO_TRY $r"
 done
 
+# Build a flat, ordered zone list: existing disk zone first (so VM and disk are always
+# co-located), then all region zones. GCP cannot attach a disk across zones.
+DISK_ZONE_HINT=""
+if [ -n "${GCP_DISK_ZONE:-}" ] && \
+   gcloud compute disks describe "$GCP_DISK_NAME" \
+       --project "$GCP_PROJECT" \
+       --zone "$GCP_DISK_ZONE" &>/dev/null 2>&1; then
+    DISK_ZONE_HINT="$GCP_DISK_ZONE"
+    echo ">>> Found existing disk '${GCP_DISK_NAME}' in ${DISK_ZONE_HINT} — trying that zone first."
+fi
+
+ZONES_TO_TRY="${DISK_ZONE_HINT}"
+for REGION in $REGIONS_TO_TRY; do
+    for SUFFIX in a b c; do
+        Z="${REGION}-${SUFFIX}"
+        [ "$Z" != "$DISK_ZONE_HINT" ] && ZONES_TO_TRY="$ZONES_TO_TRY $Z"
+    done
+done
+
 USED_ZONE=""
 USED_REGION=""
 USED_GPU=""
@@ -88,30 +107,27 @@ for ATTEMPT in $(seq 1 $MAX_RETRIES); do
         echo ""
         echo "--- Trying GPU: ${GPU_LABEL} ---"
 
-        for REGION in $REGIONS_TO_TRY; do
-            for SUFFIX in a b c; do
-                CANDIDATE_ZONE="${REGION}-${SUFFIX}"
-                echo ">>> ${CANDIDATE_ZONE} / ${GPU_LABEL}..."
-                if gcloud compute instances create "$GCP_INSTANCE_NAME" \
-                        --project "$GCP_PROJECT" \
-                        --zone "$CANDIDATE_ZONE" \
-                        --machine-type "$MACHINE_TYPE" \
-                        --maintenance-policy "TERMINATE" \
-                        --accelerator "type=${ACCEL_TYPE},count=1" \
-                        --image-family "common-cu129-ubuntu-2204-nvidia-580" \
-                        --image-project "deeplearning-platform-release" \
-                        --boot-disk-size "100" \
-                        --boot-disk-type "pd-ssd" \
-                        --tags "${WEBRTC_FIREWALL_TAG}" 2>&1; then
-                    USED_ZONE="$CANDIDATE_ZONE"
-                    USED_REGION="$REGION"
-                    USED_GPU="$GPU_LABEL"
-                    USED_MACHINE="$MACHINE_TYPE"
-                    break 4   # break out of zone / region / gpu / attempt loops
-                else
-                    echo "    no resources — trying next..."
-                fi
-            done
+        for CANDIDATE_ZONE in $ZONES_TO_TRY; do
+            echo ">>> ${CANDIDATE_ZONE} / ${GPU_LABEL}..."
+            if gcloud compute instances create "$GCP_INSTANCE_NAME" \
+                    --project "$GCP_PROJECT" \
+                    --zone "$CANDIDATE_ZONE" \
+                    --machine-type "$MACHINE_TYPE" \
+                    --maintenance-policy "TERMINATE" \
+                    --accelerator "type=${ACCEL_TYPE},count=1" \
+                    --image-family "common-cu129-ubuntu-2204-nvidia-580" \
+                    --image-project "deeplearning-platform-release" \
+                    --boot-disk-size "100" \
+                    --boot-disk-type "pd-ssd" \
+                    --tags "${WEBRTC_FIREWALL_TAG}" 2>&1; then
+                USED_ZONE="$CANDIDATE_ZONE"
+                USED_REGION="${CANDIDATE_ZONE%-*}"
+                USED_GPU="$GPU_LABEL"
+                USED_MACHINE="$MACHINE_TYPE"
+                break 3   # break out of zone / gpu / attempt loops
+            else
+                echo "    no resources — trying next..."
+            fi
         done
     done
 
@@ -205,6 +221,12 @@ fi
 echo ""
 echo ">>> Configuring SSH alias and copying bundle..."
 bash "$SCRIPT_DIR/setup-ssh.sh"
+
+# === 6. Create and attach the persistent data disk ========================
+echo ""
+echo ">>> Creating and attaching persistent data disk..."
+bash "$SCRIPT_DIR/create-disk.sh"
+bash "$SCRIPT_DIR/attach-disk.sh"
 
 echo ""
 echo "================================================================"

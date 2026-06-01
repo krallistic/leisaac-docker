@@ -31,7 +31,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-NUM_DEMOS="${NUM_DEMOS:-15}"
+NUM_DEMOS="${NUM_DEMOS:-25}"
 STEP_HZ="${STEP_HZ:-60}"
 TELEOP_DEVICE="${TELEOP_DEVICE:-so101leader}"
 REMOTE_ENDPOINT="${REMOTE_ENDPOINT:-tcp://localhost:5556}"

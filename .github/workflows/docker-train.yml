@@ -1,0 +1,86 @@
+name: Build and push lerobot (train) image to GHCR
+
+# Builds Dockerfile.train → ghcr.io/<owner>/lerobot:latest (used on RunPod).
+# Triggers on:
+#   - push to main touching the train Dockerfile, the RunPod glue, or this workflow
+#   - manual via "Run workflow" (optionally with a fresh fork clone via cachebust)
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.train'
+      - 'runpod/gcs-entrypoint.sh'
+      - 'runpod/train-and-sync.sh'
+      - '.github/workflows/docker-train.yml'
+  workflow_dispatch:
+    inputs:
+      cachebust:
+        description: 'Force a fresh clone of the lerobot fork (ignore cached layers)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free up runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR refuses upper-case in image names.
+      - name: Lowercase image namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >>"$GITHUB_OUTPUT"
+
+      # Bump CACHEBUST to re-clone the fork (manual dispatch with cachebust=true).
+      - name: Compute build args
+        id: args
+        run: |
+          if [ "${{ github.event.inputs.cachebust }}" = "true" ]; then
+            echo "cachebust=${{ github.run_id }}" >>"$GITHUB_OUTPUT"
+          else
+            echo "cachebust=0" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.train
+          push: true
+          build-args: |
+            CACHEBUST=${{ steps.args.outputs.cachebust }}
+          tags: |
+            ghcr.io/${{ steps.ns.outputs.owner }}/lerobot:latest
+            ghcr.io/${{ steps.ns.outputs.owner }}/lerobot:${{ github.sha }}
+          cache-from: type=gha,scope=lerobot-train
+          cache-to: type=gha,mode=max,scope=lerobot-train
+
+      - name: Image digest
+        run: echo "Pushed ghcr.io/${{ steps.ns.outputs.owner }}/lerobot:latest"

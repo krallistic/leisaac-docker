@@ -8,9 +8,15 @@
 #
 # Idempotent: no-op if the disk already exists in GCP_DISK_ZONE (or GCP_ZONE).
 #
+# Optional: set DISK_SOURCE_SNAPSHOT to restore the disk from a snapshot instead
+# of creating it empty (used by create-training-gcp-instance.sh to materialise
+# the data disk in whatever zone the GPU VM lands). The requested --size must be
+# >= the snapshot's source disk size.
+#
 # Usage:
 #   bash create-disk.sh                     # uses GCP_DISK_ZONE / GCP_ZONE from env.sh
 #   GCP_DISK_ZONE=us-east1-b bash create-disk.sh
+#   DISK_SOURCE_SNAPSHOT=leisaac-data-snap GCP_DISK_ZONE=us-central1-a bash create-disk.sh
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,13 +45,21 @@ if gcloud compute disks describe "$GCP_DISK_NAME" \
         --format "value(sizeGb)")
     echo ">>> Disk '${GCP_DISK_NAME}' already exists (${EXISTING_SIZE} GB) — skipping creation."
 else
-    echo ">>> Creating disk..."
-    gcloud compute disks create "$GCP_DISK_NAME" \
-        --project "$GCP_PROJECT" \
-        --zone "$ZONE" \
-        --size "${GCP_DISK_SIZE}GB" \
-        --type "$GCP_DISK_TYPE" \
+    CREATE_ARGS=(
+        "$GCP_DISK_NAME"
+        --project "$GCP_PROJECT"
+        --zone "$ZONE"
+        --size "${GCP_DISK_SIZE}GB"
+        --type "$GCP_DISK_TYPE"
         --labels "project=leisaac,managed-by=create-disk-sh"
+    )
+    if [ -n "${DISK_SOURCE_SNAPSHOT:-}" ]; then
+        echo ">>> Creating disk from snapshot '${DISK_SOURCE_SNAPSHOT}'..."
+        CREATE_ARGS+=( --source-snapshot "$DISK_SOURCE_SNAPSHOT" )
+    else
+        echo ">>> Creating empty disk..."
+    fi
+    gcloud compute disks create "${CREATE_ARGS[@]}"
     echo ">>> Disk '${GCP_DISK_NAME}' created (${GCP_DISK_SIZE} GB, ${GCP_DISK_TYPE})."
 fi
 

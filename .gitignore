@@ -1,2 +1,7 @@
 keys.sh
 env.sh.bak
+
+# GCS service-account keys for RunPod — NEVER commit these
+runpod/*.json
+runpod/*.b64
+runpod-sa-key.json*

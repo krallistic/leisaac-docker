@@ -21,6 +21,7 @@ source "$SCRIPT_DIR/common.sh"
 
 SEEDS="${SEEDS:-42 123 456}"
 STEPS="${STEPS:-50000}"
+EPOCHS="${EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 LR="${LR:-3e-5}"
 WANDB_ENABLE="${WANDB_ENABLE:-0}"
@@ -47,7 +48,7 @@ fi
 
 echo "=== ACT training ==="
 echo "  Datasets   : ${DATASET_LIST}"
-echo "  Steps      : ${STEPS}  batch=${BATCH_SIZE}  lr=${LR}"
+echo "  Epochs      : ${EPOCHS}  batch=${BATCH_SIZE}  lr=${LR}"
 echo "  Seeds      : ${SEEDS}"
 echo "  Checkpoints: ${CHECKPOINTS_DIR}"
 echo ""
@@ -65,7 +66,7 @@ for seed in $SEEDS; do
     echo "────────────────────────────────────────────────────────"
     echo ">>> Training: ${job}"
     echo ""
-    mkdir -p "${ckpt_dir}"
+    #mkdir -p "${ckpt_dir}"
 
     wandb_flags="--wandb.enable=false"
     if [ "$WANDB_ENABLE" = "1" ]; then
@@ -87,10 +88,9 @@ for seed in $SEEDS; do
         --policy.n_heads=16 \
         --output_dir="/workspace/checkpoints/${job}" \
         --job_name="${job}" \
-        --steps="${STEPS}" \
+        --epochs="${EPOCHS}" \
         --batch_size="${BATCH_SIZE}" \
-        --save_checkpoint=true \
-        --save_freq="${STEPS}" \
+        --num_workers=2 \
         --seed="${seed}" \
         $wandb_flags
 

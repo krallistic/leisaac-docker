@@ -76,8 +76,13 @@ def main():
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     from torchvision.transforms.v2 import Compose, ToPILImage
 
+    # LeRobotDataset expects root to be the dataset folder itself, not the parent.
+    # We receive the parent (HF_LEROBOT_HOME) so append the repo_id here.
+    source_root = (args.root / args.source_repo_id) if args.root is not None else None
+    target_root = (args.root / args.target_repo_id) if args.root is not None else None
+
     print(f"Loading source dataset: {args.source_repo_id}")
-    source = LeRobotDataset(args.source_repo_id, root=args.root)
+    source = LeRobotDataset(args.source_repo_id, root=source_root)
     source.image_transforms = Compose([ToPILImage()])
 
     features = {**source.meta.features}
@@ -88,7 +93,7 @@ def main():
     target = LeRobotDataset.create(
         repo_id=args.target_repo_id,
         fps=source.meta.fps,
-        root=args.root,
+        root=target_root,
         robot_type=source.meta.robot_type,
         features=features,
         use_videos=True,

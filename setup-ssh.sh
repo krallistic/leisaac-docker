@@ -36,7 +36,21 @@ if [ "$EXTERNAL_IP" != "$GCP_EXTERNAL_IP" ]; then
     echo "    (updated GCP_EXTERNAL_IP in env.sh)"
 fi
 
-# === 2. Write SSH config ==================================================
+# === 2. Update SSH firewall rule to current local IP =====================
+echo ">>> Updating SSH firewall rule to current IP..."
+LOCAL_IP=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 https://ifconfig.me)
+if [ -z "$LOCAL_IP" ]; then
+    echo "WARNING: Could not determine local IP — skipping firewall update."
+else
+    echo "    Local IP: $LOCAL_IP"
+    gcloud compute firewall-rules update default-allow-ssh \
+        --project "$GCP_PROJECT" \
+        --source-ranges="${LOCAL_IP}/32" \
+        --quiet
+    echo "    Firewall updated."
+fi
+
+# === 3. Write SSH config ==================================================
 SSH_CONFIG="$HOME/.ssh/config"
 mkdir -p "$HOME/.ssh"
 touch "$SSH_CONFIG"
@@ -88,7 +102,7 @@ EOF
 echo ""
 echo ">>> Wrote SSH alias '${GCP_SSH_ALIAS}' to ${SSH_CONFIG}"
 
-# === 3. Wait for SSH ======================================================
+# === 4. Wait for SSH ======================================================
 echo ""
 echo ">>> Waiting for SSH to accept connections..."
 SSH_READY=0
@@ -109,7 +123,7 @@ if [ "$SSH_READY" != "1" ]; then
     exit 0
 fi
 
-# === 4. Copy bundle to instance ===========================================
+# === 5. Copy bundle to instance ===========================================
 echo ""
 echo ">>> Copying bundle to ${GCP_SSH_ALIAS}:/workspace/ ..."
 ssh "${GCP_SSH_ALIAS}" "sudo mkdir -p /workspace && sudo chown \$USER:\$USER /workspace"

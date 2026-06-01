@@ -68,15 +68,22 @@ if have_libs; then
 fi
 
 # --- Detect driver branch (e.g. 580) and package flavor (-server or "") ------
-# pipefail is NOT set, so a failing nvidia-smi still yields exit 0 here.
+# CAUTION: when the kernel module isn't loaded, nvidia-smi prints
+#   "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver"
+# to STDOUT (not stderr), so `2>/dev/null` does NOT hide it and `cut -d.`
+# yields that sentence as a bogus, non-empty "branch". So accept the nvidia-smi
+# result ONLY if it's purely numeric; otherwise fall back to the installed
+# package version, which is reliable even with the module unloaded.
 BRANCH="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
           | head -1 | cut -d. -f1)"
-if [ -z "$BRANCH" ]; then
+if ! [[ "$BRANCH" =~ ^[0-9]+$ ]]; then
     BRANCH="$(dpkg -l 'libnvidia-compute-*' 2>/dev/null \
               | awk '/^ii/{print $2}' | grep -oE '[0-9]+' | head -1)"
 fi
-if [ -z "$BRANCH" ]; then
+if ! [[ "$BRANCH" =~ ^[0-9]+$ ]]; then
     echo "ERROR: could not determine NVIDIA driver branch."
+    echo "       nvidia-smi can't reach the driver and no libnvidia-compute-* package was found."
+    echo "       Check: dpkg -l 'libnvidia-compute-*'   and   dmesg | grep -i nvidia"
     exit 1
 fi
 

@@ -109,6 +109,7 @@ for seed in $SEEDS; do
         --job_name="${job}" \
         --steps="${STEPS}" \
         --batch_size="${BATCH_SIZE}" \
+        --num_workers=2 \
         --save_checkpoint=true \
         --save_freq="${STEPS}" \
         --seed="${seed}" \

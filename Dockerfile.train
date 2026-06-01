@@ -31,6 +31,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python -m venv /opt/venv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# --- Google Cloud SDK: `gcloud storage` + gsutil for GCS dataset/checkpoint I/O.
+# Used by the RunPod entrypoint/wrapper to pull datasets and push checkpoints.
+# Harmless for the eval/server use of this image (entrypoint is a no-op passthrough
+# when GCP_SA_KEY_B64 is unset).
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+         | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+         > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update && apt-get install -y --no-install-recommends google-cloud-cli \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # === Everything below re-runs when CACHEBUST changes (fresh fork clone). ====
 ARG CACHEBUST=0
 
@@ -48,3 +60,15 @@ RUN git clone ${LEROBOT_REPO} /lerobot \
     && /opt/venv/bin/pip install --no-cache-dir "grpcio==1.74.0" "protobuf==6.32.0"
 
 WORKDIR /lerobot
+
+# --- RunPod GCS glue (key-free: the entrypoint decodes a key only if one is
+# passed at runtime via $GCP_SA_KEY_B64; the scripts themselves carry no secret).
+COPY runpod/gcs-entrypoint.sh /usr/local/bin/gcs-entrypoint.sh
+COPY runpod/train-and-sync.sh /usr/local/bin/train-and-sync.sh
+RUN chmod +x /usr/local/bin/gcs-entrypoint.sh /usr/local/bin/train-and-sync.sh
+
+# Entrypoint configures GCS auth (no-op without $GCP_SA_KEY_B64) then exec's the
+# command. Default command runs the training sweep; eval/server usage overrides
+# it (e.g. `docker run ... lerobot:latest python -m lerobot.scripts.server`).
+ENTRYPOINT ["/usr/local/bin/gcs-entrypoint.sh"]
+CMD ["bash", "/usr/local/bin/train-and-sync.sh"]

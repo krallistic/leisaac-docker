@@ -29,9 +29,9 @@ TASK_TYPE="${TASK_TYPE:-keyboard}"
 REPO_ID="${REPO_ID:-local/so101_pick_orange}"
 FPS="${FPS:-30}"
 
-HOST_DATASETS="${HOST_DATASETS:-${WORK_DIR}/leisaac/datasets}"
+HOST_DATASETS="${HOST_DATASETS:-/data/test-recordings}"
 DATASET_FILE="${DATASET_FILE:-dataset.hdf5}"
-HOST_LEROBOT_DATASETS="${HOST_LEROBOT_DATASETS:-${WORK_DIR}/leisaac/lerobot_datasets}"
+HOST_LEROBOT_DATASETS="${HOST_LEROBOT_DATASETS:-/data/test-converted}"
 
 CONVERT_IMAGE="${CONVERT_IMAGE:-leisaac-convert:latest}"
 CONVERT_CONTAINER="leisaac-convert"

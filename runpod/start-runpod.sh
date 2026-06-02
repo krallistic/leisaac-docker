@@ -25,13 +25,16 @@
 set -euo pipefail
 
 : "${GCS_BUCKET:?set GCS_BUCKET=gs://...}"
+: "${EXPERIMENT_NAME:?set EXPERIMENT_NAME (prefixes every checkpoint name)}"
 IMAGE="${IMAGE:-ghcr.io/krallistic/lerobot:latest}"
 GPU_TYPE="${GPU_TYPE:-NVIDIA A100-SXM4-80GB}"
 GPU_COUNT="${GPU_COUNT:-1}"
 DISK_GB="${DISK_GB:-60}"
 # Host must have a driver new enough for the image's PyTorch CUDA build, else
-# torch falls back to CPU ("NVIDIA driver too old"). cu128 torch needs >= 12.8.
-MIN_CUDA="${MIN_CUDA:-12.8}"
+# torch falls back to CPU ("NVIDIA driver too old"). The image's torch is cu129,
+# so the host needs CUDA >= 12.9. (Durable fix: pin torch to an older CUDA in
+# Dockerfile.train so it runs on far more hosts — see the note in the chat.)
+MIN_CUDA="${MIN_CUDA:-12.9}"
 NAME="${NAME:-leisaac-train-$(date +%H%M%S)}"
 
 command -v runpodctl >/dev/null 2>&1 || {
@@ -58,14 +61,16 @@ echo "    policies=[${POLICIES:-concept_act_tce}]  seeds=[${SEEDS:-42 123 456}] 
 ENV_JSON=$(
     GCP_SA_KEY_B64="$KEY_ENV" \
     GCS_BUCKET="$GCS_BUCKET" \
+    EXPERIMENT_NAME="$EXPERIMENT_NAME" \
     POLICIES="${POLICIES:-concept_act_tce}" \
+    PERCENTS="${PERCENTS:-0.2 0.4 0.6 0.8 1.0}" \
     SEEDS="${SEEDS:-42 123 456}" \
     EPOCHS="${EPOCHS:-5}" \
     BATCH_SIZE="${BATCH_SIZE:-32}" \
     LR="${LR:-3e-5}" \
     CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}" \
     NUM_WORKERS="${NUM_WORKERS:-4}" \
-    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET POLICIES SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
+    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET EXPERIMENT_NAME POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
 )
 
 # We do NOT pass --docker-args: the image's ENTRYPOINT + CMD run train-and-sync.sh.
@@ -81,6 +86,7 @@ runpodctl pod create \
     --env "$ENV_JSON"
 
 echo ""
+echo ">>> experiment=${EXPERIMENT_NAME}  policies=[${POLICIES:-concept_act_tce}]  percents=[${PERCENTS:-0.2 0.4 0.6 0.8 1.0}]  seeds=[${SEEDS:-42 123 456}]"
 echo ">>> launched. Watch:  runpodctl pod list   (then the RunPod web log viewer)"
 echo ">>> when the sweep finishes the container exits; TERMINATE the pod to stop billing:"
 echo ">>>   runpodctl pod stop <id>   &&   runpodctl pod remove <id>"

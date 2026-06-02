@@ -84,7 +84,7 @@ train_one() {      # $1 = policy, $2 = percent, $3 = seed
     case "$policy" in
         act)
             base="act_lr${LR}"
-            ds="$(dataset_list 'sim/sort_object_')"
+            ds="$(dataset_list 'sim/sort_object_with_concepts_')"   # was 'sim/sort_object_'
             pol=( --policy.type=act --epochs="$EPOCHS" ) ;;
         concept_act_tce)
             base="concept_act_tce_cw${CONCEPT_WEIGHT}_lr${LR}"

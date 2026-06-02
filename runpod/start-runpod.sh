@@ -3,8 +3,8 @@
 # Run locally. Requires runpodctl (https://github.com/runpod/runpodctl) configured:
 #   runpodctl config --apiKey <YOUR_RUNPOD_API_KEY>
 #
-# The pod pulls datasets from GCS, trains POLICIES × SEEDS, and syncs each
-# checkpoint back to GCS (see train-and-sync.sh, the image's default CMD).
+# The pod pulls datasets from GCS, trains POLICIES × PERCENTS × SEEDS, and syncs
+# each checkpoint back to GCS (see train-and-sync.sh, the image's default CMD).
 #
 # GCS auth — provide the SA key ONE of two ways:
 #   (preferred)  RUNPOD_SECRET_NAME=gcp_key   → injects {{ RUNPOD_SECRET_gcp_key }}
@@ -15,16 +15,19 @@
 # Parallelism: this launches ONE pod per call. To shard the sweep across pods,
 # call it several times with different POLICIES / SEEDS (e.g. one pod per policy).
 #
-# Env:
-#   GCS_BUCKET   gs://...   (required)
-#   IMAGE        (default ghcr.io/krallistic/lerobot:latest)
-#   GPU_TYPE     (default "NVIDIA A100 80GB PCIe")   GPU_COUNT (default 1)
-#   DISK_GB      container disk GB (default 60)
-#   NAME         pod name (default leisaac-train-<ts>)
-#   POLICIES SEEDS STEPS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS  (passed through)
+# Env (all overridable; bucket + key have local defaults below):
+#   GCS_BUCKET      gs://...
+#   EXPERIMENT_NAME prefix for every checkpoint name (required)
+#   IMAGE           (default ghcr.io/krallistic/lerobot:latest)
+#   GPU_TYPE        (default "NVIDIA A100-SXM4-80GB")   GPU_COUNT (default 1)
+#   MIN_CUDA        min host CUDA (default 12.9)        DISK_GB (default 60)
+#   NAME            pod name (default leisaac-train-<ts>)
+#   POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS  (passed through)
 set -euo pipefail
 
-: "${GCS_BUCKET:?set GCS_BUCKET=gs://...}"
+GCS_BUCKET="${GCS_BUCKET:-gs://leisaac-training-uni-ulm-compute-stuff}"
+GCP_KEY_FILE="${GCP_KEY_FILE:-/Users/jakobkaralus/uni/leisaac-docker/runpod/runpod-sa-key.json}"
+
 : "${EXPERIMENT_NAME:?set EXPERIMENT_NAME (prefixes every checkpoint name)}"
 IMAGE="${IMAGE:-ghcr.io/krallistic/lerobot:latest}"
 GPU_TYPE="${GPU_TYPE:-NVIDIA A100-SXM4-80GB}"
@@ -53,8 +56,7 @@ else
 fi
 
 echo ">>> launching pod '${NAME}'"
-echo "    image=${IMAGE}  gpu=${GPU_TYPE} x${GPU_COUNT}  disk=${DISK_GB}GB"
-echo "    policies=[${POLICIES:-concept_act_tce}]  seeds=[${SEEDS:-42 123 456}]  steps=${STEPS:-50000}"
+echo "    image=${IMAGE}  gpu=${GPU_TYPE} x${GPU_COUNT}  disk=${DISK_GB}GB  min_cuda=${MIN_CUDA}"
 
 # This runpodctl version wants --env as a SINGLE JSON object (not repeated
 # --env KEY=VALUE). Build it with python3 so values are JSON-escaped correctly.

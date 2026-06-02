@@ -27,7 +27,7 @@ POLICIES="${POLICIES:-concept_act_tce}"
 SEEDS="${SEEDS:-42 123 456}"
 STEPS="${STEPS:-50000}"
 EPOCHS="${EPOCHS:-5}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-3e-5}"
 CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}"
 CONCEPT_DIM="${CONCEPT_DIM:-128}"
@@ -81,14 +81,14 @@ train_one() {      # $1 = policy, $2 = seed
             pol=( --policy.type=concept_act --policy.use_concept_learning=true
                   --policy.concept_method=transformer_ce --policy.use_class_aware_concepts=true
                   --policy.concept_weight="$CONCEPT_WEIGHT"
-                  --steps="$STEPS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
+                  --epochs="$EPOCHS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
         concept_act_ph)
             job="concept_act_ph_cw${CONCEPT_WEIGHT}_lr${LR}_seed${seed}"
             ds="$(dataset_list 'sim/sort_object_with_concepts_')"
             pol=( --policy.type=concept_act --policy.use_concept_learning=true
                   --policy.concept_method=prediction_head
                   --policy.concept_weight="$CONCEPT_WEIGHT" --policy.concept_dim="$CONCEPT_DIM"
-                  --steps="$STEPS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
+                  --epochs="$EPOCHS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
         lavact)
             if ! python -c "import voltron" 2>/dev/null; then
                 echo "  [skip] lavact — voltron-robotics not in image (add it to Dockerfile.train)"; return
@@ -124,13 +124,23 @@ train_one() {      # $1 = policy, $2 = seed
 }
 
 echo "=== sweep: policies=[${POLICIES}]  seeds=[${SEEDS}] ==="
+FAILED_JOBS=()
 for policy in $POLICIES; do
     for seed in $SEEDS; do
-        train_one "$policy" "$seed"
+        # `set -e` would abort the WHOLE sweep if one run errors; catch it so the
+        # remaining jobs still run (and still get synced).
+        if ! train_one "$policy" "$seed"; then
+            echo "!!! FAILED: ${policy} seed=${seed} — continuing with the rest"
+            FAILED_JOBS+=("${policy}:${seed}")
+        fi
     done
 done
 
-echo "=== sweep complete — all checkpoints in ${GCS_BUCKET}/checkpoints ==="
+if [ ${#FAILED_JOBS[@]} -gt 0 ]; then
+    echo "=== sweep finished with FAILURES: ${FAILED_JOBS[*]} ==="
+else
+    echo "=== sweep complete — all checkpoints in ${GCS_BUCKET}/checkpoints ==="
+fi
 if [ "${KEEP_ALIVE:-0}" = "1" ]; then
     echo ">>> KEEP_ALIVE=1 — sleeping; terminate the pod manually when done."
     sleep infinity

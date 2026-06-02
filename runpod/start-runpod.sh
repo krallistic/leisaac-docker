@@ -26,9 +26,12 @@ set -euo pipefail
 
 : "${GCS_BUCKET:?set GCS_BUCKET=gs://...}"
 IMAGE="${IMAGE:-ghcr.io/krallistic/lerobot:latest}"
-GPU_TYPE="${GPU_TYPE:-NVIDIA A100 80GB PCIe}"
+GPU_TYPE="${GPU_TYPE:-NVIDIA A100-SXM4-80GB}"
 GPU_COUNT="${GPU_COUNT:-1}"
 DISK_GB="${DISK_GB:-60}"
+# Host must have a driver new enough for the image's PyTorch CUDA build, else
+# torch falls back to CPU ("NVIDIA driver too old"). cu128 torch needs >= 12.8.
+MIN_CUDA="${MIN_CUDA:-12.8}"
 NAME="${NAME:-leisaac-train-$(date +%H%M%S)}"
 
 command -v runpodctl >/dev/null 2>&1 || {
@@ -50,26 +53,35 @@ echo ">>> launching pod '${NAME}'"
 echo "    image=${IMAGE}  gpu=${GPU_TYPE} x${GPU_COUNT}  disk=${DISK_GB}GB"
 echo "    policies=[${POLICIES:-concept_act_tce}]  seeds=[${SEEDS:-42 123 456}]  steps=${STEPS:-50000}"
 
-# NOTE: runpodctl flag names vary by version — verify with `runpodctl create pod --help`.
-# We do NOT pass a start command: the image's ENTRYPOINT + CMD run train-and-sync.sh.
-runpodctl create pod \
+# This runpodctl version wants --env as a SINGLE JSON object (not repeated
+# --env KEY=VALUE). Build it with python3 so values are JSON-escaped correctly.
+ENV_JSON=$(
+    GCP_SA_KEY_B64="$KEY_ENV" \
+    GCS_BUCKET="$GCS_BUCKET" \
+    POLICIES="${POLICIES:-concept_act_tce}" \
+    SEEDS="${SEEDS:-42 123 456}" \
+    EPOCHS="${EPOCHS:-5}" \
+    BATCH_SIZE="${BATCH_SIZE:-32}" \
+    LR="${LR:-3e-5}" \
+    CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}" \
+    NUM_WORKERS="${NUM_WORKERS:-4}" \
+    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET POLICIES SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
+)
+
+# We do NOT pass --docker-args: the image's ENTRYPOINT + CMD run train-and-sync.sh.
+# Verify the GPU id with `runpodctl gpu list`.
+# Private GHCR image? add:  --registry-auth-id <id>   (runpodctl registry list/create)
+runpodctl pod create \
     --name "$NAME" \
-    --imageName "$IMAGE" \
-    --gpuType "$GPU_TYPE" \
-    --gpuCount "$GPU_COUNT" \
-    --containerDiskSize "$DISK_GB" \
-    --env "GCP_SA_KEY_B64=${KEY_ENV}" \
-    --env "GCS_BUCKET=${GCS_BUCKET}" \
-    --env "POLICIES=${POLICIES:-concept_act_tce}" \
-    --env "SEEDS=${SEEDS:-42 123 456}" \
-    --env "STEPS=${STEPS:-50000}" \
-    --env "EPOCHS=${EPOCHS:-5}" \
-    --env "BATCH_SIZE=${BATCH_SIZE:-8}" \
-    --env "LR=${LR:-3e-5}" \
-    --env "CONCEPT_WEIGHT=${CONCEPT_WEIGHT:-0.2}" \
-    --env "NUM_WORKERS=${NUM_WORKERS:-4}"
+    --image "$IMAGE" \
+    --gpu-id "$GPU_TYPE" \
+    --gpu-count "$GPU_COUNT" \
+    --container-disk-in-gb "$DISK_GB" \
+    --min-cuda-version "$MIN_CUDA" \
+    --env "$ENV_JSON"
 
 echo ""
-echo ">>> launched. Watch logs:  runpodctl get pod    (then the RunPod web log viewer)"
-echo ">>> the pod stops itself when the sweep finishes (KEEP_ALIVE=0)."
+echo ">>> launched. Watch:  runpodctl pod list   (then the RunPod web log viewer)"
+echo ">>> when the sweep finishes the container exits; TERMINATE the pod to stop billing:"
+echo ">>>   runpodctl pod stop <id>   &&   runpodctl pod remove <id>"
 echo ">>> pull results:  gcloud storage rsync -r ${GCS_BUCKET}/checkpoints /data/sorting-experiment/checkpoints"

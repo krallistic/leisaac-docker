@@ -43,7 +43,15 @@ fi
 if ! gcloud iam service-accounts describe "$SA_EMAIL" --project "$GCP_PROJECT" &>/dev/null; then
     gcloud iam service-accounts create "$SA_NAME" --project "$GCP_PROJECT" \
         --display-name "RunPod training GCS I/O"
-    echo ">>> service account ${SA_EMAIL} created."
+    echo ">>> service account ${SA_EMAIL} created — waiting for it to propagate..."
+    # A freshly created SA can take a few seconds to become visible, otherwise
+    # the key/IAM calls below race it and fail with NOT_FOUND.
+    for _ in $(seq 1 30); do
+        if gcloud iam service-accounts describe "$SA_EMAIL" --project "$GCP_PROJECT" &>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
 fi
 # scope it to JUST this bucket (object read/write, nothing else)
 gcloud storage buckets add-iam-policy-binding "$BUCKET" \
@@ -54,7 +62,15 @@ echo ">>> granted objectAdmin on ${BUCKET} to ${SA_EMAIL}."
 if [ -f "$KEY_FILE" ]; then
     echo ">>> key file ${KEY_FILE} already exists — reusing."
 else
-    gcloud iam service-accounts keys create "$KEY_FILE" --iam-account "$SA_EMAIL"
+    # Retry: a just-created SA can still lag for key creation (NOT_FOUND).
+    for i in $(seq 1 10); do
+        if gcloud iam service-accounts keys create "$KEY_FILE" --iam-account "$SA_EMAIL" 2>/dev/null; then
+            break
+        fi
+        echo "    SA not ready for key creation yet (attempt ${i}/10) — retrying in 3s..."
+        sleep 3
+    done
+    [ -f "$KEY_FILE" ] || { echo "ERROR: could not create key for ${SA_EMAIL} after retries."; exit 1; }
     echo ">>> key written to ${KEY_FILE}."
 fi
 chmod 600 "$KEY_FILE"

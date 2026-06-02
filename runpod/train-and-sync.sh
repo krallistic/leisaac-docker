@@ -8,9 +8,11 @@
 # Checkpoint / job naming:
 #   <EXPERIMENT_NAME>_<policy_base>_percent_<PERCENT>_seed_<SEED>
 #   policy_base:  act_lr<LR>
-#                 concept_act_tce_cw<CW>_lr<LR>
-#                 concept_act_ph_cw<CW>_lr<LR>
+#                 concept_act_tce_cw<CW>_lr<LR>[_noise<N>]
+#                 concept_act_ph_cw<CW>_lr<LR>[_noise<N>]
 #                 lavact_lr<LR>
+#   The _noise<N> suffix is added only when concept_noise > 0 (label-noise
+#   robustness experiment), so baseline (noise=0) names are unchanged.
 #
 # IDEMPOTENT: a job whose checkpoints/last/ already exists in GCS is skipped, so a
 # reclaimed spot pod simply resumes the remaining jobs after re-launch.
@@ -26,6 +28,8 @@
 #   STEPS           save_freq in steps (default 50000)   EPOCHS (default 5)
 #   BATCH_SIZE      (default 8)            LR      (default 3e-5)
 #   CONCEPT_WEIGHT  (default 0.2)          CONCEPT_DIM (prediction_head, default 128)
+#   CONCEPT_NOISES  per-class label-noise probs to sweep (default "0.0"); concept
+#                   policies only — folded into the checkpoint name as _noise<N>
 #   NUM_WORKERS     (default 4)            WANDB_ENABLE / WANDB_PROJECT
 #   VOLTRON_MODEL/FILM_HIDDEN_DIM/VOLTRON_FREEZE  (lavact only)
 #   KEEP_ALIVE      1 = sleep after the sweep (inspect the pod); default 0 = exit
@@ -42,6 +46,7 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-3e-5}"
 CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}"
 CONCEPT_DIM="${CONCEPT_DIM:-128}"
+CONCEPT_NOISES="${CONCEPT_NOISES:-0.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 WANDB_ENABLE="${WANDB_ENABLE:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-sorting-experiment-sim}"
@@ -78,27 +83,37 @@ wandb_flags() {    # $1 = job name
     fi
 }
 
-train_one() {      # $1 = policy, $2 = percent, $3 = seed
-    local policy="$1" percent="$2" seed="$3" base job ds
+train_one() {      # $1 = policy, $2 = percent, $3 = seed, $4 = concept_noise
+    local policy="$1" percent="$2" seed="$3" noise="${4:-0.0}" base job ds nsuf=""
     local -a pol
+    # Label noise only affects concept policies; tag the name so noise levels
+    # don't collide (and so the idempotent skip doesn't drop one).
+    if [ "$noise" != "0.0" ] && [ "$noise" != "0" ]; then nsuf="_noise${noise}"; fi
+    case "$policy" in
+        act|lavact)
+            if [ -n "$nsuf" ]; then
+                echo "  [skip] ${policy} — concept_noise has no effect on a non-concept policy"; return
+            fi ;;
+    esac
     case "$policy" in
         act)
             base="act_lr${LR}"
             ds="$(dataset_list 'sim/sort_object_')"
             pol=( --policy.type=act --epochs="$EPOCHS" ) ;;
         concept_act_tce)
-            base="concept_act_tce_cw${CONCEPT_WEIGHT}_lr${LR}"
+            base="concept_act_tce_cw${CONCEPT_WEIGHT}_lr${LR}${nsuf}"
             ds="$(dataset_list 'sim/sort_object_with_concepts_')"
             pol=( --policy.type=concept_act --policy.use_concept_learning=true
                   --policy.concept_method=transformer_ce --policy.use_class_aware_concepts=true
-                  --policy.concept_weight="$CONCEPT_WEIGHT"
+                  --policy.concept_weight="$CONCEPT_WEIGHT" --policy.concept_noise="$noise"
                   --epochs="$EPOCHS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
         concept_act_ph)
-            base="concept_act_ph_cw${CONCEPT_WEIGHT}_lr${LR}"
+            base="concept_act_ph_cw${CONCEPT_WEIGHT}_lr${LR}${nsuf}"
             ds="$(dataset_list 'sim/sort_object_with_concepts_')"
             pol=( --policy.type=concept_act --policy.use_concept_learning=true
                   --policy.concept_method=prediction_head
                   --policy.concept_weight="$CONCEPT_WEIGHT" --policy.concept_dim="$CONCEPT_DIM"
+                  --policy.concept_noise="$noise"
                   --epochs="$EPOCHS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
         lavact)
             if ! python -c "import voltron" 2>/dev/null; then
@@ -138,17 +153,19 @@ train_one() {      # $1 = policy, $2 = percent, $3 = seed
     echo ">>> done ${job}"
 }
 
-echo "=== sweep: experiment=${EXPERIMENT_NAME}  policies=[${POLICIES}]  percents=[${PERCENTS}]  seeds=[${SEEDS}] ==="
+echo "=== sweep: experiment=${EXPERIMENT_NAME}  policies=[${POLICIES}]  percents=[${PERCENTS}]  noises=[${CONCEPT_NOISES}]  seeds=[${SEEDS}] ==="
 FAILED_JOBS=()
 for policy in $POLICIES; do
-    for percent in $PERCENTS; do
-        for seed in $SEEDS; do
-            # `set -e` would abort the WHOLE sweep if one run errors; catch it so
-            # the remaining jobs still run (and still get synced).
-            if ! train_one "$policy" "$percent" "$seed"; then
-                echo "!!! FAILED: ${policy} percent=${percent} seed=${seed} — continuing"
-                FAILED_JOBS+=("${policy}:${percent}:${seed}")
-            fi
+    for noise in $CONCEPT_NOISES; do
+        for percent in $PERCENTS; do
+            for seed in $SEEDS; do
+                # `set -e` would abort the WHOLE sweep if one run errors; catch it so
+                # the remaining jobs still run (and still get synced).
+                if ! train_one "$policy" "$percent" "$seed" "$noise"; then
+                    echo "!!! FAILED: ${policy} noise=${noise} percent=${percent} seed=${seed} — continuing"
+                    FAILED_JOBS+=("${policy}:noise${noise}:${percent}:${seed}")
+                fi
+            done
         done
     done
 done

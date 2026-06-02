@@ -22,7 +22,7 @@
 #   GPU_TYPE        (default "NVIDIA A100-SXM4-80GB")   GPU_COUNT (default 1)
 #   MIN_CUDA        min host CUDA (default 12.9)        DISK_GB (default 60)
 #   NAME            pod name (default leisaac-train-<ts>)
-#   POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS  (passed through)
+#   POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES NUM_WORKERS  (passed through)
 set -euo pipefail
 
 GCS_BUCKET="${GCS_BUCKET:-gs://leisaac-training-uni-ulm-compute-stuff}"
@@ -71,8 +71,9 @@ ENV_JSON=$(
     BATCH_SIZE="${BATCH_SIZE:-32}" \
     LR="${LR:-3e-5}" \
     CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}" \
+    CONCEPT_NOISES="${CONCEPT_NOISES:-0.0}" \
     NUM_WORKERS="${NUM_WORKERS:-4}" \
-    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET EXPERIMENT_NAME POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
+    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET EXPERIMENT_NAME POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
 )
 
 # We do NOT pass --docker-args: the image's ENTRYPOINT + CMD run train-and-sync.sh.
@@ -88,7 +89,7 @@ runpodctl pod create \
     --env "$ENV_JSON"
 
 echo ""
-echo ">>> experiment=${EXPERIMENT_NAME}  policies=[${POLICIES:-concept_act_tce}]  percents=[${PERCENTS:-0.2 0.4 0.6 0.8 1.0}]  seeds=[${SEEDS:-42 123 456}]"
+echo ">>> experiment=${EXPERIMENT_NAME}  policies=[${POLICIES:-concept_act_tce}]  percents=[${PERCENTS:-0.2 0.4 0.6 0.8 1.0}]  noises=[${CONCEPT_NOISES:-0.0}]  seeds=[${SEEDS:-42 123 456}]"
 echo ">>> launched. Watch:  runpodctl pod list   (then the RunPod web log viewer)"
 echo ">>> when the sweep finishes the container exits; TERMINATE the pod to stop billing:"
 echo ">>>   runpodctl pod stop <id>   &&   runpodctl pod remove <id>"

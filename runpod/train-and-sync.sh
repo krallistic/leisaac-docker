@@ -38,6 +38,8 @@
 #                   — folded into the checkpoint name as _grp<G> when != all
 #   DIFFUSION_LR    LR for the diffusion policy (default 1e-4)
 #   DIFFUSION_CROP  crop_shape for diffusion: "null" = full image (default), or "[H,W]"
+#   DIFFUSION_STEPS total training steps for diffusion (default 20000; diffusion runs in
+#                   STEPS mode, not epochs — see the diffusion case for why)
 #   NUM_WORKERS     (default 4)            WANDB_ENABLE / WANDB_PROJECT
 #   VOLTRON_MODEL/FILM_HIDDEN_DIM/VOLTRON_FREEZE  (lavact only)
 #   KEEP_ALIVE      1 = sleep after the sweep (inspect the pod); default 0 = exit
@@ -58,6 +60,7 @@ CONCEPT_NOISES="${CONCEPT_NOISES:-0.0}"
 CONCEPT_GROUP="${CONCEPT_GROUP:-all}"
 DIFFUSION_LR="${DIFFUSION_LR:-1e-4}"        # diffusion policy uses its own LR (not the ACT LR)
 DIFFUSION_CROP="${DIFFUSION_CROP:-null}"    # null = no crop / full image (matches ACT)
+DIFFUSION_STEPS="${DIFFUSION_STEPS:-20000}" # diffusion trains in STEPS mode (see note in diffusion case)
 NUM_WORKERS="${NUM_WORKERS:-4}"
 WANDB_ENABLE="${WANDB_ENABLE:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-sorting-experiment-sim}"
@@ -153,11 +156,15 @@ train_one() {      # $1 = policy, $2 = percent, $3 = seed, $4 = concept_noise
             # LeRobot's built-in Diffusion Policy (plain datasets, no concepts). crop_shape
             # defaults to "null" = full 480x640 image (matches ACT; default (84,84) would
             # crop peripheral objects out). Uses its own LR (DIFFUSION_LR, default 1e-4).
+            # NOTE: trains in STEPS mode, not epochs — diffusion has a cosine LR scheduler,
+            # and this train.py builds the scheduler before converting epochs->steps, so in
+            # epochs mode cfg.steps is None and scheduler.build() crashes. ACT-family has no
+            # scheduler so it's unaffected. DIFFUSION_STEPS is a fixed budget (not data-scaled).
             base="diffusion_lr${DIFFUSION_LR}"
             ds="$(dataset_list 'sim/sort_object_')"
             pol=( --policy.type=diffusion --policy.optimizer_lr="$DIFFUSION_LR"
                   --policy.crop_shape="$DIFFUSION_CROP"
-                  --epochs="$EPOCHS" --save_checkpoint=true --save_freq="$STEPS" ) ;;
+                  --steps="$DIFFUSION_STEPS" --save_checkpoint=true --save_freq="$DIFFUSION_STEPS" ) ;;
         lavact)
             if ! python -c "import voltron" 2>/dev/null; then
                 echo "  [skip] lavact — voltron-robotics not in image (add it to Dockerfile.train)"; return

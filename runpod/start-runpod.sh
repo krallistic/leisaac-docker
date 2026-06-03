@@ -22,7 +22,7 @@
 #   GPU_TYPE        (default "NVIDIA A100-SXM4-80GB")   GPU_COUNT (default 1)
 #   MIN_CUDA        min host CUDA (default 12.9)        DISK_GB (default 60)
 #   NAME            pod name (default leisaac-train-<ts>)
-#   POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES NUM_WORKERS  (passed through)
+#   POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES CONCEPT_GROUP DIFFUSION_LR DIFFUSION_CROP NUM_WORKERS  (passed through)
 set -euo pipefail
 
 GCS_BUCKET="${GCS_BUCKET:-gs://leisaac-training-uni-ulm-compute-stuff}"
@@ -72,8 +72,11 @@ ENV_JSON=$(
     LR="${LR:-3e-5}" \
     CONCEPT_WEIGHT="${CONCEPT_WEIGHT:-0.2}" \
     CONCEPT_NOISES="${CONCEPT_NOISES:-0.0}" \
+    CONCEPT_GROUP="${CONCEPT_GROUP:-all}" \
+    DIFFUSION_LR="${DIFFUSION_LR:-1e-4}" \
+    DIFFUSION_CROP="${DIFFUSION_CROP:-null}" \
     NUM_WORKERS="${NUM_WORKERS:-4}" \
-    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET EXPERIMENT_NAME POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
+    python3 -c 'import json,os; ks="GCP_SA_KEY_B64 GCS_BUCKET EXPERIMENT_NAME POLICIES PERCENTS SEEDS EPOCHS BATCH_SIZE LR CONCEPT_WEIGHT CONCEPT_NOISES CONCEPT_GROUP DIFFUSION_LR DIFFUSION_CROP NUM_WORKERS".split(); print(json.dumps({k: os.environ[k] for k in ks}))'
 )
 
 # We do NOT pass --docker-args: the image's ENTRYPOINT + CMD run train-and-sync.sh.

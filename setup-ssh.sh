@@ -37,17 +37,33 @@ if [ "$EXTERNAL_IP" != "$GCP_EXTERNAL_IP" ]; then
 fi
 
 # === 2. Update SSH firewall rule to current local IP =====================
+# Restrict port 22 to this machine's current public IP. Look it up via ipify
+# (ifconfig.me as fallback). The 'default-allow-ssh' rule may not exist (custom
+# VPC, or it was deleted), so create-or-update it instead of a bare `update`,
+# which would abort the whole script under `set -e`.
 echo ">>> Updating SSH firewall rule to current IP..."
 LOCAL_IP=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 https://ifconfig.me)
 if [ -z "$LOCAL_IP" ]; then
     echo "WARNING: Could not determine local IP — skipping firewall update."
-else
+elif gcloud compute firewall-rules describe default-allow-ssh \
+        --project "$GCP_PROJECT" >/dev/null 2>&1; then
     echo "    Local IP: $LOCAL_IP"
     gcloud compute firewall-rules update default-allow-ssh \
         --project "$GCP_PROJECT" \
         --source-ranges="${LOCAL_IP}/32" \
         --quiet
-    echo "    Firewall updated."
+    echo "    Firewall rule 'default-allow-ssh' updated → ${LOCAL_IP}/32."
+else
+    echo "    Local IP: $LOCAL_IP"
+    echo "    'default-allow-ssh' not found — creating it (ingress tcp:22)..."
+    gcloud compute firewall-rules create default-allow-ssh \
+        --project "$GCP_PROJECT" \
+        --direction=INGRESS \
+        --action=ALLOW \
+        --rules=tcp:22 \
+        --source-ranges="${LOCAL_IP}/32" \
+        --quiet
+    echo "    Firewall rule 'default-allow-ssh' created → ${LOCAL_IP}/32."
 fi
 
 # === 3. Write SSH config ==================================================

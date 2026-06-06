@@ -10,7 +10,7 @@ export GCP_REGION="europe-west4"
                                            # Other EU options: europe-west4 (NL),
                                            #                   europe-west3 (Frankfurt)
 export GCP_INSTANCE_NAME="leisaac-dev"
-export GCP_MACHINE_TYPE="n1-standard-8"
+export GCP_MACHINE_TYPE="g2-standard-4"
                                            # NOTE: NVIDIA recommends g2-standard-4+
                                            # for Isaac Sim; bump if you see OOM.
 
@@ -20,7 +20,7 @@ export GCP_SSH_USER="jakobkaralus"
 export GCP_SSH_KEY="$HOME/.ssh/google_compute_engine"    # the key you registered            # GCP sets up an account with your local username
 
 # ── Filled in automatically by create-gcp-instance.sh / setup-ssh.sh ─────
-export GCP_EXTERNAL_IP="34.34.127.215"
+export GCP_EXTERNAL_IP="34.34.79.190"
 
 # ── WebRTC ports (direct — no remapping on GCP, opened via firewall rule) ─
 export SIGNAL_PORT="49100"     # TCP — Isaac Sim WebRTC signaling
@@ -46,4 +46,4 @@ export REMOTE_CONDA="/opt/miniconda3"
 export REMOTE_PYTHON="$REMOTE_CONDA/envs/leisaac/bin/python"
 export REMOTE_WORK="${GCP_DISK_MOUNT}"     # all data lives on the persistent disk
 
-export GCP_ZONE="europe-west4-a"
+export GCP_ZONE="europe-west4-c"

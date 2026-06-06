@@ -1,262 +1,324 @@
 #!/bin/bash
-# 04-eval.sh — Evaluate trained policies on the held-out sort-object test cases
-# in simulation using the two-container gRPC architecture.
+# 04-eval.sh — Evaluate trained sorting-experiment policies that now live in GCS
+# (pushed by runpod/train-and-sync.sh) in the IsaacLab simulation, on an L4 GCP
+# instance.
 #
-# Architecture (mirrors tests/test-9-eval-lerobot.sh):
-#   Container 1  lerobot:latest    — policy gRPC server
-#   Container 2  leisaac:latest    — sorting_experiment_eval.py (Isaac Sim client)
-# Both containers use --network=host. Streaming over Tailscale.
+# WHAT CHANGED vs the old local-disk version: training moved to RunPod and every
+# checkpoint is synced to GCS, so this script no longer reads checkpoints from
+# /data. Instead it:
+#   1. lists the checkpoint jobs under  gs://<bucket>/checkpoints/
+#   2. for each job, skips it if  gs://<bucket>/eval/<job>/  already has results
+#      for every test case (set FORCE=1 to re-eval)
+#   3. downloads ONLY the latest step's pretrained_model to a host staging dir
+#   4. reads the policy type from the checkpoint's config.json ("type")
+#   5. runs the two-container gRPC eval via docker compose (docker-compose.eval.yml)
+#   6. uploads each results.json to  gs://<bucket>/eval/<job>/<case>/results.json
+#
+# CHECKPOINT PATH NOTE: train.py writes checkpoints/last/ as a SYMLINK to the
+# latest step dir, and symlinks are NOT synced to GCS. So under each job there is
+#   gs://<bucket>/checkpoints/<job>/checkpoints/<STEP>/pretrained_model/
+# (no "last/"). We pick the highest-numbered <STEP>.
+#
+# POLICY TYPE: taken from pretrained_model/config.json ("type" = act |
+# concept_act | diffusion | lavact) and passed to the eval client as
+# lerobot-<type>. No name parsing.
+#
+# Architecture (docker-compose.eval.yml):
+#   policy-server  lerobot:latest   gRPC policy server (one fresh server per job)
+#   eval-client    leisaac:latest   sorting_experiment_eval.py (one run per case)
+# Both use network_mode: host.
 #
 # Per-episode scoring (see sorting_experiment_eval.py):
-#   3 = complete success: object in the correct area
-#   2 = wrong sort: object placed in the wrong area
-#   1 = place failed: object was lifted but not placed in any area
-#   0 = pick failed: object was never lifted
-#
+#   3 = success (correct area)  2 = wrong area  1 = lifted not placed  0 = never lifted
 # Sorting rule (matches sort_object_env_cfg.py _SORTING_TABLE):
-#   Area A: (cube ∧ color∈{red,green}) ∨ (cylinder ∧ blue)
-#   Area B: everything else
-# Test cases: cube_red → A,  rectangle_yellow → B
-#
-# Output per checkpoint × test case:
-#   /data/sorting-experiment/eval/{experiment_name}/{case}/results.json
-#
-# A run is skipped when results.json already exists. Set FORCE=1 to re-run.
+#   Area A: (cube ∧ {red,green}) ∨ (cylinder ∧ blue);  Area B: everything else
+#   Test cases: cube_red → A,  rectangle_yellow → B
 #
 # Key overrideable env vars:
-#   EVAL_ROUNDS      episodes per test case per checkpoint (default: 10)
-#   STEP_HZ          env stepping rate in Hz (default: 30)
-#   POLICY_PORT      gRPC port for the policy server (default: 5555)
-#   FORCE            1 = re-evaluate even if results.json exists (default: 0)
-#   CHECKPOINT_GLOB  glob to select a subset of experiment dirs (default: *)
-#   EPISODE_LENGTH_S max seconds per episode (default: 60)
-
-set -e
+#   GCS_BUCKET        gs://...                  (default gs://leisaac-training-<project>)
+#   GCP_KEY_FILE      SA key activated for GCS  (default ../runpod/runpod-sa-key.json)
+#   SKIP_GCS_AUTH=1   don't activate the SA key (use ambient gcloud creds)
+#   CHECKPOINT_GLOB   job-name glob to select a subset of jobs (default *)
+#   EVAL_ROUNDS       episodes per test case (default 10)
+#   STEP_HZ           env stepping rate Hz (default 30)
+#   EPISODE_LENGTH_S  max seconds per episode (default 30, matches the env design)
+#   RENDER_INTERVAL   render+refresh cameras every N steps (speed); unset = every step.
+#                     Try 16 (= policy_action_horizon). Obs goes N-steps stale — A/B-validate.
+#   POLICY_PORT       gRPC port (default 5555)
+#   FORCE=1           re-evaluate even if results exist in GCS (overwrites)
+#   APPEND=1          accumulate: add EVAL_ROUNDS more episodes onto the existing
+#                     GCS results.json (merged + re-aggregated). Implies a re-run.
+#   LIVESTREAM        0 = headless (default); 2 = WebRTC stream (needs Tailscale)
+#   CLEANUP_STAGING   delete the downloaded checkpoint after each job (default 1,
+#                     so /data doesn't fill up over a 144-job sweep); set 0 to keep
+#   LAVACT_INSTRUCTION_TEMPLATE  language template for lavact ({color}/{shape}/{area})
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-EVAL_ROUNDS="${EVAL_ROUNDS:-10}"
+# ── Config ────────────────────────────────────────────────────────────────────
+GCS_BUCKET="${GCS_BUCKET:-gs://leisaac-training-${GCP_PROJECT:-uni-ulm-compute-stuff}}"
+GCP_KEY_FILE="${GCP_KEY_FILE:-${SCRIPT_DIR}/../runpod/runpod-sa-key.json}"
+SKIP_GCS_AUTH="${SKIP_GCS_AUTH:-0}"
+CHECKPOINT_GLOB="${CHECKPOINT_GLOB:-*}"
+EVAL_ROUNDS="${EVAL_ROUNDS:-5}"
 STEP_HZ="${STEP_HZ:-30}"
+EPISODE_LENGTH_S="${EPISODE_LENGTH_S:-20}"   # matches the env's own design value
 POLICY_PORT="${POLICY_PORT:-5555}"
 FORCE="${FORCE:-0}"
-CHECKPOINT_GLOB="${CHECKPOINT_GLOB:-*}"
-EPISODE_LENGTH_S="${EPISODE_LENGTH_S:-60}"
+APPEND="${APPEND:-0}"
+LIVESTREAM="${LIVESTREAM:-0}"
+CLEANUP_STAGING="${CLEANUP_STAGING:-1}"   # default: delete each checkpoint after its job (avoid filling /data); set 0 to keep
 
-# ── Discover trained checkpoints ──────────────────────────────────────────────
-CHECKPOINTS=()
-while IFS= read -r -d '' last_dir; do
-    exp_name="$(basename "$(dirname "$(dirname "$last_dir")")")"
-    CHECKPOINTS+=("$exp_name")
-done < <(find "${CHECKPOINTS_DIR}" -path "*/${CHECKPOINT_GLOB}/checkpoints/last" -type d -print0 2>/dev/null | sort -z)
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.eval.yml"
+COMPOSE_PROJECT="sorting-eval"
+EVAL_SCRIPT="${SCRIPT_DIR}/sorting_experiment_eval.py"
+STAGING_DIR="${EXP_DIR}/eval-staging/checkpoints"   # EXP_DIR from common.sh
+mkdir -p "$STAGING_DIR" "$EVAL_DIR"
 
-echo "=== Sort-object evaluation (structured) ==="
-echo "  Checkpoints dir : ${CHECKPOINTS_DIR}"
-echo "  Test cases      : ${TEST_CASES[*]}"
-echo "  Scoring rule    : Area A = (cube∧{red,green}) ∨ (cylinder∧blue); else Area B"
-echo "  Eval rounds     : ${EVAL_ROUNDS} per case  step_hz=${STEP_HZ}"
-echo ""
+# ── Env consumed by docker-compose.eval.yml (${VAR} interpolation) ────────────
+export LEROBOT_IMAGE
+export LEISAAC_IMAGE="$IMAGE"          # common.sh sets IMAGE to the leisaac image
+export POLICY_PORT LEISAAC_SRC CACHE_ROOT WORK_DIR EVAL_SCRIPT
+export HOST_CHECKPOINTS="$STAGING_DIR"
+export HOST_EVAL="$EVAL_DIR"
 
-if [ ${#CHECKPOINTS[@]} -eq 0 ]; then
-    echo "No checkpoints found in ${CHECKPOINTS_DIR}. Run 03-train.sh first."
-    exit 1
+COMPOSE=(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE")
+
+# ── GCS auth ──────────────────────────────────────────────────────────────────
+# The L4 instance's default compute SA only has the read-only storage scope, so
+# pushing results back would fail. Activate the bucket-scoped runpod SA key
+# (objectAdmin) the way the RunPod side authenticates.
+if [ "$SKIP_GCS_AUTH" != "1" ] && [ -f "$GCP_KEY_FILE" ]; then
+    echo ">>> Activating GCS service account: ${GCP_KEY_FILE}"
+    gcloud auth activate-service-account --key-file="$GCP_KEY_FILE" --quiet
+elif [ "$SKIP_GCS_AUTH" != "1" ]; then
+    echo ">>> No SA key at ${GCP_KEY_FILE} — using ambient gcloud credentials."
+    echo "    (writing results to GCS needs read+write on ${GCS_BUCKET}.)"
 fi
 
-echo "Found ${#CHECKPOINTS[@]} checkpoint(s):"
-for exp in "${CHECKPOINTS[@]}"; do
-    echo "  ${exp}"
-done
-echo ""
+# ── Streaming / kit args ──────────────────────────────────────────────────────
+if [ "$LIVESTREAM" != "0" ]; then
+    build_kit_args                       # enforces Tailscale, sets KIT_ARGS + endpoint
+    LIVESTREAM_FLAG=(--livestream "$LIVESTREAM")
+else
+    KIT_ARGS="--/rtx/verifyDriverVersion/enabled=false"
+    LIVESTREAM_FLAG=()
+fi
 
-build_kit_args
-echo ""
+# Optional render throttle (speed): render + refresh cameras only every N steps
+# instead of every step. ~85% of eval time is rendering, and the policy reads an
+# obs only every policy_action_horizon steps, so RENDER_INTERVAL=16 can cut most
+# of it. Makes obs up to N steps stale — A/B-validate scores before trusting it.
+RENDER_FLAG=()
+[ -n "${RENDER_INTERVAL:-}" ] && RENDER_FLAG=(--render_interval="$RENDER_INTERVAL")
 
-# ── Main eval loop ────────────────────────────────────────────────────────────
-for exp_name in "${CHECKPOINTS[@]}"; do
-    CKPT_PATH_HOST="${CHECKPOINTS_DIR}/${exp_name}/checkpoints/last/pretrained_model"
-    CKPT_PATH_CTR="/workspace/checkpoints/${exp_name}/checkpoints/last/pretrained_model"
-    SERVER_CONTAINER="lerobot-server-${exp_name}"
+# APPEND: accumulate eval rounds across runs. The existing GCS results.json is
+# pre-downloaded per case (below) so the eval script prepends its episodes.
+APPEND_FLAG=()
+[ "$APPEND" = "1" ] && APPEND_FLAG=(--append)
 
-    # Infer policy type from experiment name prefix
-    if [[ "$exp_name" == concept_act* ]]; then
-        POLICY_TYPE="lerobot-concept_act"
-    elif [[ "$exp_name" == lavact* ]]; then
-        POLICY_TYPE="lerobot-lavact"
-    else
-        POLICY_TYPE="lerobot-act"
+cleanup() { "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+# Clear any stale stack from a crashed run (the fixed container_name would
+# otherwise block `up`).
+"${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+
+# ── GCS helpers ───────────────────────────────────────────────────────────────
+gcs_has() { gcloud storage ls "$1" >/dev/null 2>&1; }
+
+# Highest numeric step dir under <job>/checkpoints/  (no "last" symlink in GCS).
+highest_step() {
+    gcloud storage ls "${GCS_BUCKET}/checkpoints/$1/checkpoints/" 2>/dev/null \
+        | sed -n 's#.*/checkpoints/\([0-9][0-9]*\)/$#\1#p' | sort -n | tail -1
+}
+
+# ── Evaluate one checkpoint job (all not-yet-done test cases) ─────────────────
+eval_one_job() {
+    local job="$1" step c
+    step="$(highest_step "$job")"
+    if [ -z "$step" ]; then
+        echo "  [skip] ${job} — no numeric step checkpoint found in GCS"
+        return 0
     fi
+
+    # Which test cases still need an eval?
+    local need=()
+    for c in "${TEST_CASES[@]}"; do
+        if [ "$FORCE" = "1" ] || [ "$APPEND" = "1" ] || ! gcs_has "${GCS_BUCKET}/eval/${job}/${c}/results.json"; then
+            need+=("$c")
+        fi
+    done
+    if [ ${#need[@]} -eq 0 ]; then
+        echo "  [skip] ${job} — eval already in GCS for all test cases"
+        return 0
+    fi
+
+    # Pull just the latest step's pretrained_model (idempotent rsync).
+    local pm_gcs="${GCS_BUCKET}/checkpoints/${job}/checkpoints/${step}/pretrained_model"
+    local pm_local="${STAGING_DIR}/${job}/checkpoints/${step}/pretrained_model"
+    local ckpt_ctr="/workspace/checkpoints/${job}/checkpoints/${step}/pretrained_model"
+    mkdir -p "$pm_local"
+    echo ">>> [${job}] downloading checkpoint (step ${step}) ..."
+    if ! gcloud storage rsync -r "$pm_gcs" "$pm_local"; then
+        echo "  [fail] ${job} — could not download ${pm_gcs}"
+        [ "$CLEANUP_STAGING" = "1" ] && rm -rf "${STAGING_DIR:?}/${job}"   # drop partial download
+        return 1
+    fi
+
+    # Policy type from config.json: act | concept_act | diffusion | lavact.
+    local ptype policy_type
+    ptype="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['type'])" \
+             "${pm_local}/config.json" 2>/dev/null)"
+    if [ -z "$ptype" ]; then
+        echo "  [warn] ${job} — could not read 'type' from config.json; defaulting to act"
+        ptype="act"
+    fi
+    policy_type="lerobot-${ptype}"
 
     echo "════════════════════════════════════════════════════════"
-    echo ">>> Checkpoint : ${exp_name}"
-    echo ">>> Policy type: ${POLICY_TYPE}"
+    echo ">>> Job         : ${job}"
+    echo ">>> Step        : ${step}"
+    echo ">>> Policy type : ${policy_type}"
+    echo ">>> Cases       : ${need[*]}"
     echo ""
 
-    # Skip entirely if all test cases are already evaluated
-    all_done=1
-    for case in "${TEST_CASES[@]}"; do
-        result="${EVAL_DIR}/${exp_name}/${case}/results.json"
-        if [ ! -f "$result" ] || [ "$FORCE" = "1" ]; then
-            all_done=0; break
-        fi
-    done
-    if [ "$all_done" = "1" ]; then
-        echo "  [skip] all test cases already have results.json."
-        echo ""
-        continue
+    # Fresh policy server for THIS checkpoint (serves both its test cases).
+    if ! "${COMPOSE[@]}" up -d --wait policy-server; then
+        echo "  [fail] ${job} — policy server did not become healthy"
+        "${COMPOSE[@]}" logs --tail 40 policy-server 2>/dev/null || true
+        "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+        return 1
     fi
 
-    # ── Start policy server ───────────────────────────────────────────────────
-    docker rm "$SERVER_CONTAINER" >/dev/null 2>&1 || true
+    local rc=0
+    for c in "${need[@]}"; do
+        local task shape color area out_ctr out_host
+        task="$(case_to_task "$c")"
+        shape="$(case_shape "$c")"; color="$(case_color "$c")"
+        area="$(determine_dropoff "$color" "$shape")"
+        out_ctr="/workspace/eval/${job}/${c}/results.json"
+        out_host="${EVAL_DIR}/${job}/${c}/results.json"
 
-    echo ">>> Starting policy server (port ${POLICY_PORT})..."
-    docker run -d \
-        --name "$SERVER_CONTAINER" \
-        --gpus all --network=host \
-        -v "${CHECKPOINTS_DIR}:/workspace/checkpoints:ro" \
-        "$LEROBOT_IMAGE" \
-        python -m lerobot.scripts.server.policy_server \
-        --port "${POLICY_PORT}"
-
-    # Poll until the server is reachable (up to 120 s)
-    MAX_WAIT=120; ELAPSED=0
-    until docker exec "$SERVER_CONTAINER" python -c \
-        "import socket,sys; s=socket.socket(); s.settimeout(2); r=s.connect_ex(('localhost',${POLICY_PORT})); s.close(); sys.exit(r)" \
-        >/dev/null 2>&1; do
-        sleep 3; ELAPSED=$((ELAPSED + 3))
-        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-            echo "ERROR: policy server did not start within ${MAX_WAIT}s."
-            docker stop "$SERVER_CONTAINER" >/dev/null 2>&1 || true
-            exit 1
+        # APPEND: seed the local file from GCS so the eval script (mounted at
+        # out_ctr) can prepend the prior episodes and accumulate rounds.
+        if [ "$APPEND" = "1" ] && gcs_has "${GCS_BUCKET}/eval/${job}/${c}/results.json"; then
+            mkdir -p "$(dirname "$out_host")"
+            gcloud storage cp "${GCS_BUCKET}/eval/${job}/${c}/results.json" "$out_host" >/dev/null 2>&1 || true
         fi
-        echo "  ... waiting for server (${ELAPSED}s)"
-    done
-    echo ">>> Policy server is up."
-    echo ""
 
-    cleanup_server() {
-        echo ">>> Stopping policy server..."
-        docker stop "$SERVER_CONTAINER" >/dev/null 2>&1 || true
-        docker rm   "$SERVER_CONTAINER" >/dev/null 2>&1 || true
-    }
-    trap cleanup_server EXIT
+        # lavact needs a per-case language instruction; other policies ignore it.
+        local lang=()
+        if [[ "$policy_type" == *lavact* ]]; then
+            local tmpl instr
+            tmpl="${LAVACT_INSTRUCTION_TEMPLATE:-Pick up the {color} {shape} and place it in Area {area}}"
+            instr="${tmpl//\{color\}/$color}"
+            instr="${instr//\{shape\}/$shape}"
+            instr="${instr//\{area\}/$area}"
+            lang=(--policy_language_instruction="$instr")
+        fi
 
-    # ── Evaluate each test case ───────────────────────────────────────────────
-    for case in "${TEST_CASES[@]}"; do
-        TASK="$(case_to_task "$case")"
-        shape="$(case_shape "$case")"; color="$(case_color "$case")"
-        expected_area="$(determine_dropoff "$color" "$shape")"
-        RESULT_DIR="${EVAL_DIR}/${exp_name}/${case}"
-        RESULT_JSON="${RESULT_DIR}/results.json"
-        EVAL_CONTAINER="lerobot-eval-${exp_name}-${case}"
-
-        if [ -f "$RESULT_JSON" ] && [ "$FORCE" != "1" ]; then
-            echo "  [skip] ${case} — results.json already exists."
+        echo "──────────────────────────────────────────"
+        echo ">>> Eval ${job} × ${c}  (task=${task}  expected_area=${area}  rounds=${EVAL_ROUNDS})"
+        if ! "${COMPOSE[@]}" run --rm --no-deps eval-client \
+                /workspace/sorting_experiment_eval.py \
+                --task="$task" --case="$c" --checkpoint_name="$job" \
+                --policy_type="$policy_type" \
+                --policy_host=localhost --policy_port="$POLICY_PORT" \
+                --policy_checkpoint_path="$ckpt_ctr" \
+                --eval_rounds="$EVAL_ROUNDS" --step_hz="$STEP_HZ" \
+                --episode_length_s="$EPISODE_LENGTH_S" \
+                "${RENDER_FLAG[@]}" "${APPEND_FLAG[@]}" \
+                --output_json="$out_ctr" \
+                "${lang[@]}" \
+                --device=cuda --headless --enable_cameras \
+                "${LIVESTREAM_FLAG[@]}" \
+                --kit_args="$KIT_ARGS"; then
+            echo "  [fail] eval ${job} × ${c}"
+            rc=1
             continue
         fi
 
-        mkdir -p "$RESULT_DIR"
-        docker rm "$EVAL_CONTAINER" >/dev/null 2>&1 || true
-
-        # Result JSON will be written inside the container at this path.
-        RESULT_JSON_CTR="/workspace/eval/${exp_name}/${case}/results.json"
-
-        # For LAVact: provide a per-case language instruction so the model can
-        # condition on the specific object and target area.
-        # Override LAVACT_INSTRUCTION_TEMPLATE to change the format; use the
-        # variables {color}, {shape}, {area} which are substituted below.
-        LANG_FLAGS=()
-        if [[ "$POLICY_TYPE" == *lavact* ]]; then
-            template="${LAVACT_INSTRUCTION_TEMPLATE:-Pick up the {color} {shape} and place it in Area {area}}"
-            instruction="${template//\{color\}/$color}"
-            instruction="${instruction//\{shape\}/$shape}"
-            instruction="${instruction//\{area\}/$expected_area}"
-            LANG_FLAGS=(--policy_language_instruction="${instruction}")
-        fi
-
-        echo "────────────────────────────────────────────────────────"
-        echo ">>> Eval: ${exp_name} × ${case}"
-        echo ">>>   Task         : ${TASK}"
-        echo ">>>   Expected area: ${expected_area}"
-        echo ">>>   Rounds       : ${EVAL_ROUNDS}"
-        if [ ${#LANG_FLAGS[@]} -gt 0 ]; then
-            echo ">>>   Language instr: ${LANG_FLAGS[0]#*=}"
-        fi
-        echo ">>>   Output JSON  : ${RESULT_JSON}"
-        echo ""
-
-        # The sort_object assets are BAKED INTO the image; do NOT mount the
-        # host assets directory (would shadow the baked-in sort_object USD).
-        docker run --rm --name "$EVAL_CONTAINER" \
-            --gpus all --network=host \
-            -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y \
-            -e NVIDIA_DRIVER_CAPABILITIES=all \
-            -e PYTHONPATH="${LEISAAC_SRC}" \
-            -v "${CHECKPOINTS_DIR}:/workspace/checkpoints:ro" \
-            -v "${EVAL_DIR}:/workspace/eval" \
-            -v "${SCRIPT_DIR}/sorting_experiment_eval.py:/workspace/sorting_experiment_eval.py:ro" \
-            -v "${CACHE_ROOT}/kit:/isaac-sim/kit/cache:rw" \
-            -v "${CACHE_ROOT}/ov:/isaac-sim/.cache/ov:rw" \
-            -v "${CACHE_ROOT}/glcache:/isaac-sim/.cache/nvidia/GLCache:rw" \
-            -v "${CACHE_ROOT}/computecache:/isaac-sim/.nv/ComputeCache:rw" \
-            -v "${CACHE_ROOT}/pip:/isaac-sim/.cache/pip:rw" \
-            -v "${WORK_DIR}/docker/leisaac/logs:/isaac-sim/.nvidia-omniverse/logs:rw" \
-            -v /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro \
-            --entrypoint /isaac-sim/python.sh \
-            "$IMAGE" \
-            /workspace/sorting_experiment_eval.py \
-            --task="${TASK}" \
-            --case="${case}" \
-            --checkpoint_name="${exp_name}" \
-            --policy_type="${POLICY_TYPE}" \
-            --policy_host="localhost" \
-            --policy_port="${POLICY_PORT}" \
-            --policy_checkpoint_path="${CKPT_PATH_CTR}" \
-            --eval_rounds="${EVAL_ROUNDS}" \
-            --step_hz="${STEP_HZ}" \
-            --episode_length_s="${EPISODE_LENGTH_S}" \
-            --output_json="${RESULT_JSON_CTR}" \
-            "${LANG_FLAGS[@]}" \
-            --device=cuda --headless --enable_cameras \
-            --livestream 2 \
-            --kit_args="${KIT_ARGS}"
-
-        echo ""
-        if [ -f "$RESULT_JSON" ]; then
-            # Print a one-line summary from the JSON
+        if [ -f "$out_host" ]; then
+            echo ">>> syncing results → ${GCS_BUCKET}/eval/${job}/${c}/results.json"
+            gcloud storage cp "$out_host" "${GCS_BUCKET}/eval/${job}/${c}/results.json" || rc=1
             python3 -c "
-import json, sys
-with open('${RESULT_JSON}') as f: d = json.load(f)
-a = d['aggregated']
-print(f'  success_rate={a[\"success_rate\"]:.1%}  avg_score={a[\"average_score\"]:.2f}  dist={a[\"score_distribution\"]}')
-" 2>/dev/null || true
+import json
+a = json.load(open('${out_host}'))['aggregated']
+print(f'    success={a[\"success_rate\"]:.1%}  avg={a[\"average_score\"]:.2f}  dist={a[\"score_distribution\"]}')" 2>/dev/null || true
+        else
+            echo "  [warn] no results.json produced for ${job} × ${c}"
+            rc=1
         fi
-        echo ""
     done
 
-    cleanup_server
-    trap - EXIT
+    "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+
+    if [ "$CLEANUP_STAGING" = "1" ]; then
+        echo ">>> cleaning up local checkpoint ${STAGING_DIR}/${job}"
+        rm -rf "${STAGING_DIR:?}/${job}"
+    fi
+    return $rc
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+echo "=== Sort-object evaluation from GCS ==="
+echo "  Bucket      : ${GCS_BUCKET}"
+echo "  Job filter  : ${CHECKPOINT_GLOB}"
+echo "  Test cases  : ${TEST_CASES[*]}"
+echo "  Eval rounds : ${EVAL_ROUNDS}  step_hz=${STEP_HZ}  episode_len=${EPISODE_LENGTH_S}s"
+echo "  Streaming   : $([ "$LIVESTREAM" != 0 ] && echo "livestream ${LIVESTREAM}" || echo "headless")"
+echo "  Scoring     : Area A = (cube∧{red,green}) ∨ (cylinder∧blue); else Area B"
+echo ""
+
+# Discover checkpoint jobs from GCS and apply the glob filter.
+JOBS=()
+while IFS= read -r j; do
+    [ -z "$j" ] && continue
+    case "$j" in $CHECKPOINT_GLOB) JOBS+=("$j") ;; esac
+done < <(gcloud storage ls "${GCS_BUCKET}/checkpoints/" 2>/dev/null \
+         | sed -n 's#.*/checkpoints/\([^/][^/]*\)/$#\1#p' | sort)
+
+if [ ${#JOBS[@]} -eq 0 ]; then
+    echo "No checkpoint jobs found in ${GCS_BUCKET}/checkpoints matching '${CHECKPOINT_GLOB}'."
+    echo "(Has training synced yet? Check: gcloud storage ls ${GCS_BUCKET}/checkpoints/)"
+    exit 1
+fi
+
+echo "Found ${#JOBS[@]} checkpoint job(s) to consider:"
+printf '  %s\n' "${JOBS[@]}"
+echo ""
+
+FAILED=()
+for job in "${JOBS[@]}"; do
+    if ! eval_one_job "$job"; then
+        FAILED+=("$job")
+        echo "!!! issues evaluating ${job} — continuing"
+    fi
     echo ""
 done
 
-# ── Cross-checkpoint summary ──────────────────────────────────────────────────
+# ── Summary (jobs evaluated this run; everything also lives in GCS eval/) ─────
 echo "=== Evaluation summary ==="
-for exp_name in "${CHECKPOINTS[@]}"; do
-    for case in "${TEST_CASES[@]}"; do
-        result="${EVAL_DIR}/${exp_name}/${case}/results.json"
-        if [ -f "$result" ]; then
-            python3 -c "
+for job in "${JOBS[@]}"; do
+    for c in "${TEST_CASES[@]}"; do
+        r="${EVAL_DIR}/${job}/${c}/results.json"
+        [ -f "$r" ] || continue
+        python3 -c "
 import json
-with open('${result}') as f: d = json.load(f)
-a = d['aggregated']
-m = d['metadata']
-print(f'  {m[\"checkpoint\"]:50s}  {m[\"case\"]:20s}  '
-      f'success={a[\"success_rate\"]:5.1%}  avg={a[\"average_score\"]:.2f}  '
-      f'[3:{a[\"score_distribution\"][\"score_3_success\"]} '
-      f'2:{a[\"score_distribution\"][\"score_2_wrong_sort\"]} '
-      f'1:{a[\"score_distribution\"][\"score_1_place_failed\"]} '
-      f'0:{a[\"score_distribution\"][\"score_0_pick_failed\"]}]')
-" 2>/dev/null || echo "  ${exp_name} / ${case} — [parse error]"
-        fi
+d = json.load(open('${r}')); a = d['aggregated']; m = d['metadata']
+sd = a['score_distribution']
+print(f'  {m[\"checkpoint\"]:54s} {m[\"case\"]:18s} '
+      f'success={a[\"success_rate\"]:5.1%} avg={a[\"average_score\"]:.2f} '
+      f'[3:{sd[\"score_3_success\"]} 2:{sd[\"score_2_wrong_sort\"]} '
+      f'1:{sd[\"score_1_place_failed\"]} 0:{sd[\"score_0_pick_failed\"]}]')" 2>/dev/null \
+        || echo "  ${job} / ${c} — [parse error]"
     done
 done
 echo ""
-echo "All results in: ${EVAL_DIR}"
+echo "Results in GCS: ${GCS_BUCKET}/eval/   (local copies under ${EVAL_DIR})"
+if [ ${#FAILED[@]} -gt 0 ]; then
+    echo "FAILURES: ${FAILED[*]}"
+    exit 1
+fi
+echo "All done."

@@ -57,9 +57,20 @@ parser.add_argument("--policy_checkpoint_path", default=None)
 parser.add_argument("--policy_language_instruction", default=None)
 parser.add_argument("--eval_rounds", type=int, default=10)
 parser.add_argument("--step_hz",     type=int, default=30)
+parser.add_argument("--real_time",   action="store_true",
+                    help="Pace stepping to step_hz (real-time). Off by default; only useful for smooth "
+                         "viewing — it never speeds eval up, it only caps stepping at real-time.")
+parser.add_argument("--render_interval", type=int, default=None,
+                    help="Render + refresh cameras only every N physics steps instead of every step. "
+                         "Speeds up render-bound eval ~Nx but makes the visual obs up to N steps stale — "
+                         "A/B-validate scores first. Try N = policy_action_horizon (e.g. 16). "
+                         "Default: render every step (unchanged behavior).")
 parser.add_argument("--episode_length_s", type=float, default=60.0)
 parser.add_argument("--seed",        type=int, default=None)
 parser.add_argument("--output_json", default=None, help="Path to write results JSON (printed to stdout if omitted)")
+parser.add_argument("--append", action="store_true",
+                    help="Accumulate rounds: prepend the episodes from an existing --output_json and "
+                         "recompute the aggregate over the full set, so repeated runs add eval_rounds each.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -151,6 +162,12 @@ def preprocess_obs(obs_dict: dict, language_instruction: str) -> dict:
     return obs_dict
 
 
+def _log(msg: str = "") -> None:
+    """Print a log line prefixed with a UTC timestamp (same ISO format Isaac
+    Sim/carb emit), so per-episode timing is visible in interleaved logs."""
+    print(f"[{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%dT%H:%M:%SZ}] {msg}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -170,10 +187,10 @@ def main():
         or f"Pick up the {color} {shape} and place it in the correct box."
     )
 
-    print(f"[SortEval] Case          : {args_cli.case}  (shape={shape}  color={color})")
-    print(f"[SortEval] Correct area  : {correct_area}  (box prim: {correct_box})")
-    print(f"[SortEval] Checkpoint    : {args_cli.checkpoint_name}")
-    print(f"[SortEval] Eval rounds   : {args_cli.eval_rounds}")
+    _log(f"[SortEval] Case          : {args_cli.case}  (shape={shape}  color={color})")
+    _log(f"[SortEval] Correct area  : {correct_area}  (box prim: {correct_box})")
+    _log(f"[SortEval] Checkpoint    : {args_cli.checkpoint_name}")
+    _log(f"[SortEval] Eval rounds   : {args_cli.eval_rounds}")
     print()
 
     # ── Build env ────────────────────────────────────────────────────────────
@@ -183,6 +200,24 @@ def main():
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
     env_cfg.episode_length_s = args_cli.episode_length_s
     env_cfg.recorders = None
+
+    # OPTIONAL render throttle (speed). The policy reads an observation only once
+    # per action chunk (policy_action_horizon steps), but Isaac Sim renders the
+    # cameras on every env.step — ~16x more often than consumed, and rendering is
+    # ~85% of eval wall-time. Setting sim.render_interval renders only every N
+    # physics steps; aligning the camera update_period to it keeps obs = latest
+    # rendered frame. Default (None): unchanged. WARNING: this makes the visual
+    # obs up to N steps stale, which can shift closed-loop behavior — A/B one
+    # checkpoint against the default and confirm the score distribution matches.
+    if args_cli.render_interval is not None:
+        env_cfg.sim.render_interval = args_cli.render_interval
+        _period = args_cli.render_interval * env_cfg.sim.dt
+        for _cam in ("wrist", "front"):
+            _cam_cfg = getattr(env_cfg.scene, _cam, None)
+            if _cam_cfg is not None and hasattr(_cam_cfg, "update_period"):
+                _cam_cfg.update_period = _period
+        _log(f"[SortEval] render throttle ON: sim.render_interval={args_cli.render_interval}, "
+             f"camera update_period={_period:.3f}s (obs refresh every {args_cli.render_interval} steps)")
 
     env: ManagerBasedRLEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
 
@@ -207,7 +242,19 @@ def main():
         device=args_cli.device,
     )
 
-    rate_limiter = RateLimiter(args_cli.step_hz)
+    # Real-time pacing only matters when a human is watching the WebRTC stream.
+    # In headless batch eval it just caps the sim at real-time (≥ episode_length_s
+    # of wall-clock per episode, regardless of GPU speed) and renders extra
+    # viewport frames during its sleep — so skip it and let the sim run flat out.
+    # Physics/obs/scores are unchanged: env.step advances a fixed dt per call no
+    # matter the wall-clock pacing. Re-enable by streaming (--livestream > 0).
+    # Real-time pacing (rate limiter) never speeds eval up — it only caps stepping
+    # at real-time for smooth human viewing — so it's OFF by default. Pass
+    # --real_time to re-enable it. Decoupled from --livestream so a streamed run
+    # is still a flat-out, apples-to-apples speed comparison vs headless.
+    rate_limiter = RateLimiter(args_cli.step_hz) if args_cli.real_time else None
+    if rate_limiter is None:
+        _log("[SortEval] rate limiter OFF — stepping flat out (use --real_time to pace)")
     obs_dict, _ = env.reset()
 
     # ── Episode loop ──────────────────────────────────────────────────────────
@@ -216,23 +263,32 @@ def main():
 
     while ep < args_cli.eval_rounds:
         ep += 1
-        print(f"[SortEval] Episode {ep}/{args_cli.eval_rounds} ...")
+        _ep_start = time.time()
+        _log(f"[SortEval] Episode {ep}/{args_cli.eval_rounds} ...")
 
         success   = False
         time_out  = False
         max_obj_z = object_local_z(env, shape)  # track lift height
+        t_predict = t_step = 0.0   # per-phase wall time (predict = gRPC + server inference)
+        n_predict = n_step = 0
 
         while simulation_app.is_running():
             with torch.inference_mode():
                 processed = preprocess_obs(dict(obs_dict["policy"]), language_instruction)
+                _t = time.perf_counter()
                 actions = policy.get_action(processed).to(env.device)
+                t_predict += time.perf_counter() - _t
+                n_predict += 1
 
                 for i in range(min(args_cli.policy_action_horizon, actions.shape[0])):
                     action = actions[i, :, :]
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
 
+                    _t = time.perf_counter()
                     obs_dict, _, terminated, timed_out, _ = env.step(action)
+                    t_step += time.perf_counter() - _t
+                    n_step += 1
 
                     # Update height tracker
                     z = object_local_z(env, shape)
@@ -272,7 +328,9 @@ def main():
                 score = 0
 
         outcome = {3: "success", 2: "wrong_area", 1: "place_failed", 0: "pick_failed"}[score]
-        print(f"[SortEval]   score={score} ({outcome})  lifted={object_lifted}  placed={area_placed or 'none'}")
+        _log(f"[SortEval]   score={score} ({outcome})  lifted={object_lifted}  placed={area_placed or 'none'}  elapsed={time.time() - _ep_start:.1f}s")
+        _log(f"[SortEval]   timing: predict={t_predict:.1f}s/{n_predict} ({1000 * t_predict / max(n_predict, 1):.0f}ms ea)  "
+             f"env.step={t_step:.1f}s/{n_step} ({1000 * t_step / max(n_step, 1):.0f}ms ea)")
 
         episode_records.append({
             "episode":       ep,
@@ -283,8 +341,31 @@ def main():
             "timed_out":     time_out,
         })
 
-        # Reset for next episode.
-        obs_dict, _ = env.reset()
+        # Reset for next episode. Must run inside inference_mode: env.step() above
+        # ran under inference_mode, so the sim buffers are "inference tensors" and
+        # reset_scene_to_default writes to them in-place — illegal outside
+        # inference_mode. (Mirrors policy_inference.py, which resets in-context.)
+        with torch.inference_mode():
+            obs_dict, _ = env.reset()
+
+    # ── Append mode: merge with any existing results.json ─────────────────────
+    # APPEND accumulates rounds across runs. If the output file already exists
+    # (04-eval.sh pre-downloads it from GCS), prepend its episodes so this run
+    # *adds* args_cli.eval_rounds more. Episodes are renumbered 1..N and the
+    # aggregate below is recomputed over the full set; metadata.eval_rounds then
+    # reflects the running total.
+    if args_cli.append and args_cli.output_json and Path(args_cli.output_json).exists():
+        try:
+            prev_eps = json.loads(Path(args_cli.output_json).read_text()).get("episodes", [])
+        except (ValueError, OSError) as e:
+            _log(f"[SortEval] append: could not read existing {args_cli.output_json} ({e}) — writing fresh")
+            prev_eps = []
+        if prev_eps:
+            _new = len(episode_records)
+            episode_records = prev_eps + episode_records
+            for _i, _r in enumerate(episode_records, start=1):
+                _r["episode"] = _i
+            _log(f"[SortEval] append: {len(prev_eps)} prior + {_new} new = {len(episode_records)} total episodes")
 
     # ── Aggregate results ─────────────────────────────────────────────────────
     scores = [r["score"] for r in episode_records]
@@ -300,7 +381,7 @@ def main():
             "color":        color,
             "expected_area": correct_area,
             "task":         args_cli.task,
-            "eval_rounds":  args_cli.eval_rounds,
+            "eval_rounds":  len(episode_records),   # running total (== eval_rounds unless --append)
             "step_hz":      args_cli.step_hz,
             "policy_type":  args_cli.policy_type,
             "date":         datetime.datetime.now().isoformat(),
@@ -326,18 +407,18 @@ def main():
     }
 
     print()
-    print(f"[SortEval] ── Results ──────────────────────────────────────")
-    print(f"[SortEval]  Success rate  : {success_rate:.1%}  [{scores.count(3)}/{len(scores)}]")
-    print(f"[SortEval]  Average score : {avg_score:.2f}")
-    print(f"[SortEval]  Distribution  : {dist}")
-    print(f"[SortEval] ────────────────────────────────────────────────")
+    _log(f"[SortEval] ── Results ──────────────────────────────────────")
+    _log(f"[SortEval]  Success rate  : {success_rate:.1%}  [{scores.count(3)}/{len(scores)}]")
+    _log(f"[SortEval]  Average score : {avg_score:.2f}")
+    _log(f"[SortEval]  Distribution  : {dist}")
+    _log(f"[SortEval] ────────────────────────────────────────────────")
 
     json_str = json.dumps(results, indent=2)
     if args_cli.output_json:
         out = Path(args_cli.output_json)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json_str)
-        print(f"[SortEval] Results written to: {out}")
+        _log(f"[SortEval] Results written to: {out}")
     else:
         print(json_str)
 

@@ -1,0 +1,91 @@
+# docker-compose.eval.yml — two-container gRPC eval stack for the sorting
+# experiment, driven by 04-eval.sh.
+#
+#   policy-server  (lerobot:latest)   AsyncInference gRPC server, loads the
+#                                      checkpoint the client asks for.
+#   eval-client    (leisaac:latest)   IsaacLab env + sorting_experiment_eval.py,
+#                                      run once per (checkpoint × test case).
+#
+# Both run with network_mode: host so they talk over localhost:${POLICY_PORT}.
+# 04-eval.sh exports every ${VAR} referenced below before calling compose:
+#   LEROBOT_IMAGE LEISAAC_IMAGE POLICY_PORT
+#   HOST_CHECKPOINTS HOST_EVAL EVAL_SCRIPT CACHE_ROOT WORK_DIR LEISAAC_SRC
+#
+# Lifecycle (see 04-eval.sh):
+#   docker compose ... up -d --wait policy-server          # one fresh server per checkpoint
+#   docker compose ... run --rm --no-deps eval-client ...  # one short-lived client per case
+#   docker compose ... down --remove-orphans               # tear the pair down
+#
+# WHY a fresh server per checkpoint: the server loads whatever checkpoint the
+# client requests on connect, but restarting per checkpoint guarantees no stale
+# policy is reused across different jobs. The two held-out test cases of one job
+# share the same checkpoint, so a single server serves both.
+
+services:
+  policy-server:
+    image: ${LEROBOT_IMAGE:-lerobot:latest}
+    container_name: lerobot-eval-server
+    network_mode: host
+    volumes:
+      # Staging dir on the host that 04-eval.sh fills from GCS, one job at a
+      # time. The client passes a path under /workspace/checkpoints/... that the
+      # SERVER reads, so this mount must contain the current job's checkpoint.
+      - ${HOST_CHECKPOINTS}:/workspace/checkpoints:ro
+    command:
+      - python
+      - -m
+      - lerobot.scripts.server.policy_server
+      - --port
+      - "${POLICY_PORT:-5555}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # Up once the gRPC port accepts connections (model load happens later, on
+      # the first client connect). host networking → localhost is the host loopback.
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(s.connect_ex(('127.0.0.1', ${POLICY_PORT:-5555})))"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  eval-client:
+    image: ${LEISAAC_IMAGE:-leisaac:latest}
+    network_mode: host
+    depends_on:
+      policy-server:
+        condition: service_healthy
+    environment:
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      # Prepend the real leisaac source so Python finds the package, not the
+      # /workspace/leisaac namespace shadow (same fix as tests/common.sh).
+      - PYTHONPATH=${LEISAAC_SRC}
+    # python.sh boots the full Kit runtime; the script + flags come from
+    # `docker compose run eval-client <script> <args...>` in 04-eval.sh.
+    entrypoint: ["/isaac-sim/python.sh"]
+    volumes:
+      - ${HOST_EVAL}:/workspace/eval
+      - ${EVAL_SCRIPT}:/workspace/sorting_experiment_eval.py:ro
+      # The sort_object USD assets are BAKED INTO leisaac:latest — do NOT mount a
+      # host assets dir here (it would shadow the baked-in scene).
+      # Persisted Isaac Sim caches so shader compile is paid once per disk lifetime.
+      - ${CACHE_ROOT}/kit:/isaac-sim/kit/cache:rw
+      - ${CACHE_ROOT}/ov:/isaac-sim/.cache/ov:rw
+      - ${CACHE_ROOT}/glcache:/isaac-sim/.cache/nvidia/GLCache:rw
+      - ${CACHE_ROOT}/computecache:/isaac-sim/.nv/ComputeCache:rw
+      - ${CACHE_ROOT}/pip:/isaac-sim/.cache/pip:rw
+      - ${WORK_DIR}/docker/leisaac/logs:/isaac-sim/.nvidia-omniverse/logs:rw
+      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

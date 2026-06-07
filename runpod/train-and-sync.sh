@@ -45,6 +45,13 @@
 #   KEEP_ALIVE      1 = sleep after the sweep (inspect the pod); default 0 = exit
 set -euo pipefail
 
+# RUN_MODE=timing → hand off to the timing benchmark instead of the training sweep.
+# Both scripts are baked into the image; the launcher just flips this env var, so a
+# timing run goes through the exact same start-runpod.sh path as a training sweep.
+if [ "${RUN_MODE:-train}" = "timing" ]; then
+    exec bash /usr/local/bin/benchmark-and-sync.sh
+fi
+
 : "${GCS_BUCKET:?set GCS_BUCKET=gs://...}"
 : "${EXPERIMENT_NAME:?set EXPERIMENT_NAME (prefixes every checkpoint name)}"
 POLICIES="${POLICIES:-concept_act_tce}"

@@ -52,11 +52,16 @@ ARG CACHEBUST=0
 # extra so that the AsyncInference gRPC transport is binary-compatible.
 ARG LEROBOT_REPO=https://github.com/krallistic/lerobot.git
 ARG LEROBOT_BRANCH=
+# voltron-robotics provides the Voltron vision-language backbone used by the LAV-ACT
+# policy (`from voltron import load`). Installed after the lerobot deps and BEFORE the
+# grpcio/protobuf pin so those gRPC versions are re-asserted last and stay binary-compatible
+# with the leisaac eval container (see the version-pin note at the top of this file).
 RUN git clone ${LEROBOT_REPO} /lerobot \
     && cd /lerobot \
     && if [ -n "${LEROBOT_BRANCH}" ]; then git checkout ${LEROBOT_BRANCH}; fi \
     && /opt/venv/bin/pip install --upgrade --no-cache-dir pip \
     && /opt/venv/bin/pip install --no-cache-dir ".[smolvla]" \
+    && /opt/venv/bin/pip install --no-cache-dir voltron-robotics \
     && /opt/venv/bin/pip install --no-cache-dir "grpcio==1.74.0" "protobuf==6.32.0"
 
 WORKDIR /lerobot
@@ -65,7 +70,8 @@ WORKDIR /lerobot
 # passed at runtime via $GCP_SA_KEY_B64; the scripts themselves carry no secret).
 COPY runpod/gcs-entrypoint.sh /usr/local/bin/gcs-entrypoint.sh
 COPY runpod/train-and-sync.sh /usr/local/bin/train-and-sync.sh
-RUN chmod +x /usr/local/bin/gcs-entrypoint.sh /usr/local/bin/train-and-sync.sh
+COPY runpod/benchmark-and-sync.sh /usr/local/bin/benchmark-and-sync.sh
+RUN chmod +x /usr/local/bin/gcs-entrypoint.sh /usr/local/bin/train-and-sync.sh /usr/local/bin/benchmark-and-sync.sh
 
 # Entrypoint configures GCS auth (no-op without $GCP_SA_KEY_B64) then exec's the
 # command. Default command runs the training sweep; eval/server usage overrides

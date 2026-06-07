@@ -59,6 +59,42 @@ Each pod is idempotent: a job already in `<bucket>/checkpoints/<job>/checkpoints
 is skipped, so a reclaimed spot pod resumes the rest after re-launch. Pods exit
 when done (billing stops); set `KEEP_ALIVE=1` to keep one up for inspection.
 
+## Quick timing benchmark
+
+A separate, fast run that measures **wall-clock latency** (no training, no
+checkpoints) for each policy: the time for one train step (forward + backward +
+`optimizer.step`) and the average inference time (one full action-chunk, batch
+size 1). Models built untrained from one case's dataset — only the timings matter.
+
+```bash
+# all six models on an A100, results → <bucket>/timing/<EXPERIMENT_NAME>/
+RUNPOD_SECRET_NAME=gcp_key bash runpod/run_timing_experiment.sh
+
+# subset / bigger train batch
+POLICIES="act diffusion" BATCH_SIZE=8 RUNPOD_SECRET_NAME=gcp_key \
+  bash runpod/run_timing_experiment.sh
+```
+
+It rides the same launch path as the sweeps: `run_timing_experiment.sh` sets
+`RUN_MODE=timing`, which makes the image CMD (`train-and-sync.sh`) hand off to
+`benchmark-and-sync.sh`. That pulls one case (plain + with_concepts), runs
+`cact_scripts/timing_benchmark.py` per policy, and syncs a combined
+`timing_results.csv` (+ per-policy JSON with raw samples) to
+`<bucket>/timing/<EXPERIMENT_NAME>/`.
+
+- **Default policies:** `act concept_act_tce concept_act_ph concept_act_cbm diffusion lavact`.
+- **`lavact`** works out of the box — `voltron-robotics` is baked into the image
+  (`Dockerfile.train`). The scripts still skip it gracefully if a build somehow lacks it.
+- **Knobs:** `CASE` (default `cube_green`), `BATCH_SIZE` (32), `BENCH_INFER_BS` (1),
+  `BENCH_WARMUP`/`BENCH_ITERS` (train, 5/30), `BENCH_INFER_WARMUP`/`BENCH_INFER_ITERS`
+  (inference, 10/50). Since the python harness and the two baked shell scripts ride
+  the image, changing any of them needs a `Dockerfile.train` rebuild.
+
+Pull the results locally:
+```bash
+gcloud storage cat gs://leisaac-training-<project>/timing/<EXPERIMENT_NAME>/timing_results.csv
+```
+
 ## Pull results back for eval (on GCP)
 
 ```bash
@@ -69,8 +105,8 @@ gcloud storage rsync -r gs://leisaac-training-<project>/checkpoints \
 
 ## Notes / caveats
 
-- **`lavact`** needs `voltron-robotics` in the image — add `RUN /opt/venv/bin/pip
-  install voltron-robotics` to `Dockerfile.train` before using `POLICIES=lavact`.
+- **`lavact`** works out of the box — `voltron-robotics` is installed in the image
+  (`Dockerfile.train`, in the lerobot install layer before the grpcio/protobuf pin).
 - **`runpodctl` flags vary by version** — verify with `runpodctl create pod --help`
   and adjust `start-runpod.sh` (e.g. `--gpuType` string, `--communityCloud`).
 - **Security:** `runpod-sa-key.json*` is git-ignored. The SA is scoped to the one
